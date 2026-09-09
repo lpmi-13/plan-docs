@@ -1131,3 +1131,130 @@ The default implementation path remains the Supabase-backed Next.js vertical sli
 anonymous hunt-scoped participant sessions, minimal location retention, and advisory
 image feedback. Deviate from that path only when a Phase 0 requirement provides a
 clear product, safety, compliance, reliability, or cost reason.
+
+## 25. Post-MVP Pivot Option — Street-Food Discovery and Photo Verification
+
+### 25.1 Product Shape and Feasibility
+
+A later hunt type could ask participants to find a named or visually described street
+food in a foreign city, speak with a vendor, and submit a fresh photograph of the item.
+This is feasible as a bounded, opt-in pilot, but it is materially different from the
+location-only proof in the original MVP. A geofence can establish that a participant
+is near an intended market or neighbourhood; it cannot establish what is in a photo.
+Image recognition can provide evidence, not certainty, and visually similar dishes,
+regional variations, packaging, occlusion, lighting, and presentation will produce
+both false accepts and false rejects.
+
+Preserve the original MVP unchanged and add an explicit, versioned stage proof mode
+only after the location loop is stable:
+
+- `location_only`: the original server-authoritative geofence decision;
+- `location_plus_food_photo`: a fresh geofence decision followed by asynchronous image
+  verification; and
+- `staff_or_vendor_fallback`: a facilitator, rotating on-site QR, or short vendor code
+  for participants who cannot take or upload a suitable photograph.
+
+The participant must be told before joining when photographs are required, what may
+appear in them, who or what system reviews them, how long they are retained, and how
+to use the fallback. Avoid requiring photographs of vendors or bystanders. Provide
+framing guidance that keeps faces, payment details, vehicle registrations, and private
+interiors out of the image.
+
+### 25.2 Recommended Validation Ladder
+
+Do not begin by training a bespoke model. Validate the product need and collect error
+evidence in increasingly automated stages:
+
+1. **Staff-only/manual pilot:** require the geofence and a fresh in-app capture, then
+   place the submission in a teacher review queue. Measure submission quality,
+   ambiguity, review time, common confusions, connectivity, and participant behaviour.
+2. **General vision-model advice:** behind a `FoodVerificationService`, send a
+   privacy-reviewed, resized rendition plus the expected item, approved aliases,
+   reference images, city/market context, and a deliberately limited candidate list to
+   an image-capable model. Require structured evidence and confidence rather than a
+   free-text verdict. The model does not receive participant identity or precise
+   coordinates.
+3. **Three-way decision:** auto-accept only above a per-item high-confidence threshold;
+   send uncertain cases to staff review; give low-confidence cases neutral recapture
+   guidance. Never accuse a participant of cheating from a model result.
+4. **Specialized recognition only on evidence:** if the general model has unacceptable
+   cost, latency, or per-item accuracy and the pilot yields sufficient representative,
+   consented data, evaluate image embeddings, a transfer-learned classifier, or a
+   metric-learning model against the same held-out field set.
+
+Geofencing should run first because it cheaply narrows the context and prevents a food
+image alone from completing a location-specific stage. The photo must be captured in
+the app for the current stage and uploaded immediately with a one-time challenge. A
+perceptual hash can detect exact or near-exact replay within the authorized corpus,
+but cannot prove liveness; stronger liveness gestures or short-lived vendor markers
+should be considered only if field evidence justifies the extra friction.
+
+### 25.3 Verification Pipeline and Data Model Additions
+
+The event-critical geofence transaction should not wait on a potentially slow image
+provider. A photo stage therefore adds an explicit `awaiting_photo_review` state and
+advances only after a persisted verification decision:
+
+```text
+active --valid geofence--> awaiting_photo_upload
+       --fresh upload----> awaiting_photo_review
+       --accept----------> active at next stage / completed
+       --retry-----------> awaiting_photo_upload
+       --fallback--------> active at next stage / completed
+```
+
+Add private `submission_assets` and `food_verifications` records containing an entry,
+stage, one-time capture challenge, safe rendition key, content/perceptual hashes,
+processing state, model/provider/version, expected taxonomy version, normalized
+scores, decision source (`model`, `staff`, or `fallback`), reason code, reviewer when
+applicable, and timestamps. Do not put images, signed URLs, faces, OCR output, or model
+free text into routine logs. Keep the service interface provider-neutral and ensure a
+provider outage moves work to review rather than blocking the whole hunt.
+
+The ingestion boundary should validate the actual file signature, enforce byte/pixel
+limits, decode and re-encode, strip EXIF, create a modest inference rendition, run
+malware/abuse and accidental-face checks as approved, and delete originals promptly.
+The separately submitted fresh browser location remains the spatial evidence; EXIF is
+not trusted as location or freshness proof. Set a short default retention period for
+participant food photos and verification artifacts, and extend it for model training
+only through a separate, explicit and reviewed consent/data-governance process.
+
+### 25.4 If a Bespoke Food Model Becomes Justified
+
+Define a closed, versioned taxonomy scoped to supported cities and hunt items. “All
+street food” is not a tractable initial class set. The training corpus must include
+the intended dish across vendors, cameras, lighting, angles, portion states, packaging,
+and regional presentations, plus hard negatives such as neighbouring dishes, common
+ingredients, menu photos, screens, printed packaging, and reused web images.
+
+Split training and evaluation by vendor/location or capture session rather than random
+image so near-duplicate backgrounds cannot inflate measured performance. Report
+precision, recall, false-accept rate, false-reject rate, abstention/manual-review rate,
+latency, and cost for every supported food item and city. Re-test new vendors and
+seasonal presentation changes for drift. Maintain dataset provenance, licenses,
+consent, deletion handling, model/version lineage, reproducible training, rollback,
+and a documented human appeal path.
+
+Transfer learning or embedding-based matching will usually be a better first bespoke
+experiment than training a vision model from scratch. Required sample size cannot be
+promised in advance: run learning-curve experiments and stop if additional field data
+does not close the measured gap. Synthetic augmentation may improve lighting/crop
+robustness, but it must not replace real held-out phone photographs from the intended
+cities.
+
+### 25.5 Pilot Gates and Risks
+
+Before participants depend on automated food verification, define per-item thresholds
+and pass a prospective field test using phones, vendors, packaging, and connectivity
+representative of the event. The pilot should demonstrate an agreed low false-accept
+rate, a tolerable false-reject and manual-review rate, bounded review response time,
+graceful provider outage, replay resistance at the chosen threat level, and complete
+retention/deletion behaviour. Items that do not meet the threshold remain manual,
+use an on-site proof, or are removed from the hunt.
+
+Review cultural labeling with local experts and vendors; a model taxonomy must not
+flatten distinct dishes or declare one presentation uniquely “authentic.” Also assess
+allergy messaging, food-purchase expectations and reimbursement, vendor permission,
+crowding, photography norms, accessibility, safeguarding, and the risk that a hunt
+creates unwanted pressure on small businesses. No model score should override a
+safety decision or require a participant to buy, taste, or enter an unsafe setting.
