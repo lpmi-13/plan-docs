@@ -702,6 +702,218 @@ control problems. Do not animate thousands of DOM nodes. The companion viewer ru
 separate context and therefore does not contaminate the monitored page's metrics, but it
 still needs its own frame, memory, object-count, and thermal budgets.
 
+### 12.8 Enhanced asset generation: Blender, Meshy, and hybrid pipelines
+
+The inside-the-phone concept depends on atmosphere: a chassis that feels machined, a
+screen back with believable depth, mechanisms with material weight, and a holder who
+reads as a person rather than a placeholder. Primitive geometry and flat shading can prove
+comprehension in Phase 0, but are unlikely to deliver the memorable, richly textured scene
+the concept promises. This section evaluates ways to produce better assets without
+letting the art pipeline dominate the project or blur the telemetry.
+
+#### 12.8.1 What actually needs to be an asset
+
+Not every visual element benefits from authored or generated geometry. Divide the scene
+by how it is driven:
+
+| Layer | Examples | Driven by | Asset strategy |
+| --- | --- | --- | --- |
+| Static set dressing | Chassis shell, ribs, side-button housings, camera module, shielding cans, circuitry panels, antenna conduits | Nothing, or ambient pulse only | Best candidate for rich authored/generated meshes and baked textures |
+| Articulated mechanisms | Main-thread intake gate, frame gate/shutter, compositor rollers, worker chamber doors, queue rails | Telemetry through a small number of named transforms or shader parameters | Authored in Blender with clean pivots and named nodes; can wear generated textures |
+| Instanced dynamic objects | Task capsules, packets, halos, split pieces, merged capsules | Per-event telemetry, potentially hundreds at once | Simple procedural or low-poly authored geometry with instancing and shader-driven state; never per-instance generated meshes |
+| Outside world | Holder's hands, silhouette/figure, room beyond the screen | Recorded touch events (fingertip position/contact only) | Stylized rigged figure; generated or authored, then simplified and restyled |
+| Display plane | Reversed app icons, cards, navigation shapes | Scene state | 2D/SVG or procedural textures; no 3D generation needed |
+| Materials and lighting | Metal, PCB, glass, heat shimmer, emissive strips, environment light | Shaders, some telemetry uniforms | PBR texture sets, trim sheets, HDRI, and custom shaders |
+
+The core rule: **telemetry-carrying elements stay parametric**. Generated detail enriches
+the surroundings and the surfaces of mechanisms, but queue length, occupancy, strain, and
+missed pulses must remain driven by code-controlled transforms, instancing, and material
+parameters that map exactly to the trace.
+
+#### 12.8.2 Option A — procedural in-engine assets only (baseline)
+
+Build everything in Three.js from primitives, instancing, and custom shaders
+(signed-distance details, procedural PCB/noise textures, emissive gradients).
+
+- **Strengths:** no external tooling; fully deterministic; trivially driven by telemetry;
+  smallest download; ideal for the schematic/x-ray fallback.
+- **Weaknesses:** “rich texture” is expensive to hand-code; tends toward a clean
+  tech-demo look; organic forms such as hands are poor.
+- **Role:** Phase 0 comprehension prototypes, the required low-end fallback, and all
+  instanced dynamic objects regardless of which option is chosen for the rest.
+
+#### 12.8.3 Option B — Blender-authored assets
+
+Model, texture, and light the scene in Blender, then export glTF 2.0 (`.glb`) for
+Three.js/R3F.
+
+Useful Blender capabilities for this project:
+
+- **Hard-surface modelling and Geometry Nodes** for repetitive chassis structure: ribs,
+  vent patterns, circuit traces, cable runs, and parametric variants of mechanisms.
+- **Shader-node materials baked to texture** (albedo, normal, roughness/metallic, ambient
+  occlusion, and a separate emissive mask), so rich Cycles-quality detail survives as
+  cheap real-time maps. Baking lighting and AO into static set dressing is especially
+  effective because the camera is fixed or near-fixed.
+- **Named empties, pivots, and custom properties** exported through glTF extras, so
+  mechanisms arrive with a stable contract (for example `gate.intake.pivot`,
+  `rail.queue.slot_00`, an `emissive_state` material slot) that the renderer can bind to
+  telemetry.
+- **Shape keys and armatures** for the holder's hand/finger contact pose and for
+  mechanism states that are easier to author than to code.
+- **Headless, scripted builds** (`blender --background --python build_assets.py`) so
+  the `.blend` sources plus Python scripts regenerate exports reproducibly in CI.
+- **Agent-assisted authoring** through a Blender MCP server or Python scripting driven by
+  a coding assistant. This can speed up blockouts, naming, batch baking, and export
+  hygiene, but a human should still judge composition and art direction.
+
+- **Strengths:** full control over topology, UVs, naming, pivots, and polygon budget;
+  consistent style; reproducible; no licensing ambiguity; excellent texture baking.
+- **Weaknesses:** skilled, time-consuming work; organic detail (hands, figure) is slow to
+  make well; the art quality ceiling depends on who is doing the modelling.
+- **Role:** the backbone of any enhanced pipeline, whether or not generated assets are
+  used, because it is where scene assembly, cleanup, baking, and export happen.
+
+#### 12.8.4 Option C — Meshy AI generation
+
+[Meshy](https://www.meshy.ai/) generates textured 3D models from text or images, applies
+AI texturing to existing meshes, remeshes to target polygon counts, and can auto-rig and
+animate characters. It exports GLB, FBX, OBJ, USDZ, and other formats, and offers a
+[REST API](https://docs.meshy.ai/en) and an MCP server for agent-driven workflows.
+
+Where it fits this project:
+
+- **Set-dressing props from text or reference images:** stylized camera modules, shield
+  cans, capacitor clusters, antenna assemblies, cable bundles, and “machine-like”
+  greebles that would be tedious to model.
+- **AI texturing of Blender blockouts:** model the chassis and mechanisms with clean,
+  purposeful geometry in Blender, then use Meshy's text/image texturing to add rich
+  surface detail. This keeps the geometry contract under control while outsourcing the
+  labour-intensive surface work. It is probably the most valuable Meshy use here.
+- **Stylized holder figure and hands:** generate a neutral low-poly or clay-style figure
+  from a reference image, use auto-rigging for arm/finger posing, then simplify and
+  restyle in Blender. Hands are a known weak spot for generative 3D and need review.
+- **Rapid look-development variants:** produce several stylistic directions (brushed
+  industrial, bioluminescent, clean ceramic, warm retro-electronics) for comparison
+  before committing to one.
+
+Limitations to plan around:
+
+- **Topology and structure:** generated meshes are usually dense, triangulated, and
+  unsegmented. They lack meaningful part names, pivots, or separable moving parts and
+  normally need remeshing, decimation, and manual splitting in Blender before use.
+- **Baked-in lighting and inconsistent PBR:** albedo maps can contain shading or
+  highlights that fight the scene's lighting and telemetry emissives; roughness/metal maps
+  may need correction.
+- **Style drift:** separately generated assets rarely match each other. A shared style
+  reference image, fixed prompt vocabulary, and final unifying pass in Blender (shared
+  trim sheets, colour grading, material overrides) are necessary.
+- **Reproducibility:** regeneration does not reliably produce the same asset. Treat
+  outputs as source artefacts to be versioned, not as build steps.
+- **Licensing and privacy:** at the time of writing, free-plan outputs are public and
+  licensed under [CC BY 4.0](https://help.meshy.ai/en/articles/9992001-can-i-use-my-generated-assets-for-commercial-projects)
+  with Meshy retaining ownership, while paid plans assign ownership of outputs to the
+  customer and keep assets private; API access requires a paid plan. The copyright status
+  of AI-generated content also remains unsettled in some jurisdictions. Confirm current
+  terms before shipping.
+- **Cost:** generation is credit-based; iteration on many variants and textured
+  high-resolution outputs consumes credits quickly. Budget for exploration explicitly.
+
+- **Strengths:** fast, rich textures and organic/prop detail without specialist
+  modelling; very useful for look-development and set dressing.
+- **Weaknesses:** not directly usable for telemetry-driven mechanisms; cleanup is
+  mandatory; consistency and provenance require discipline.
+- **Role:** accelerator for surfaces, props, and the holder figure, feeding into Blender.
+
+#### 12.8.5 Option D — hybrid pipeline (recommended target)
+
+Combine the options so each does what it is good at:
+
+```text
+art direction board + style reference images
+          │
+          ▼
+Blender blockout (composition, camera, scale, named mechanism contract)
+          │                       │
+          │  export blockout      │  text/image prompts
+          ▼                       ▼
+Meshy AI texturing of      Meshy props / holder figure
+blockout meshes            (text- or image-to-3D, rigging)
+          │                       │
+          └──────────┬────────────┘
+                     ▼
+Blender cleanup & unification
+  remesh/decimate · split parts · pivots & names · UV fix
+  unify materials/trim sheets · strip baked lighting
+  bake AO/normal/emissive masks · LODs
+                     ▼
+Scripted glTF export  ──►  glTF Transform / gltfpack optimisation
+                           (meshopt or Draco, KTX2/Basis textures,
+                            dedupe, texture resize per LOD)
+                     ▼
+Three.js/R3F scene: static dressing + bound mechanisms
+                  + procedural instanced capsules/halos/shaders
+```
+
+Supporting sources can supplement both tools: CC0 material and HDRI libraries such as
+[Poly Haven](https://polyhaven.com/) and [ambientCG](https://ambientcg.com/) for base
+metals, plastics, and environment lighting, and 2D image generation for reference boards
+and screen-back decals (never for diagnostic text).
+
+#### 12.8.6 Art direction constraints that protect diagnosis
+
+Richer assets raise a specific risk for this project: detail competes with telemetry for
+the viewer's attention. Adopt these rules alongside the pipeline:
+
+- **Reserve channels for data.** Emissive colour, pulsing light, and strong saturated hues
+  belong to telemetry states. Set-dressing textures use a restrained value range and low
+  saturation so that a queue halo or missed-frame shock always reads first.
+- **Detail gradient.** Highest texture richness at the periphery and in static structure;
+  cleaner, higher-contrast forms on the main-thread line, gates, and capsules.
+- **Stylized, not literal.** Avoid realistic PCB layouts or recognisable manufacturer
+  components that could imply the scene is a literal hardware model or that a particular
+  chip is responsible for the work.
+- **Holder remains neutral.** Generated figures are reviewed for uncanny faces, identity
+  resemblance, and bias; a silhouette or clay-style figure stays the default.
+- **Reduced-motion and fallback parity.** Every rich asset has a schematic counterpart, so
+  the fallback view communicates the same state.
+
+#### 12.8.7 Asset contract and budgets
+
+Define a written contract that any asset, whatever its origin, must satisfy before it
+enters the renderer:
+
+- glTF 2.0 binary, Y-up, metres, consistent real-world scale relative to a phone chassis;
+- naming convention for bindable nodes and material slots, validated by a script;
+- separate emissive/state mask texture or vertex channel for telemetry-driven glow;
+- LOD0/LOD1 plus a schematic stand-in;
+- an asset manifest entry recording source (Blender/Meshy/CC0 library/procedural),
+  tool and model version, prompt or reference image, Meshy task ID where applicable, plan
+  tier, licence, attribution text, and author of cleanup.
+
+Provisional viewer budgets to validate in the look-development spike:
+
+| Budget | Provisional desktop/laptop target | Provisional tablet/low-end target |
+| --- | --- | --- |
+| Compressed scene download | ≤ 20 MB initial, rest streamed | ≤ 8 MB |
+| Triangles on screen | ≤ 500k | ≤ 150k |
+| GPU texture memory (KTX2) | ≤ 256 MB | ≤ 96 MB |
+| Draw calls | ≤ 200 | ≤ 80 |
+| Frame time at 60 Hz with a busy replay | p95 ≤ 12 ms | p95 ≤ 16 ms, or fall back |
+
+Because the viewer is a companion on another device, these budgets protect the viewer's
+smoothness rather than the monitored app, but a janky visualizer would still undermine its
+own lesson.
+
+#### 12.8.8 Comparison of asset options
+
+| Option | Visual richness | Telemetry bindability | Effort | Reproducibility | Licensing clarity | Suggested role |
+| --- | --- | --- | --- | --- | --- | --- |
+| A. Procedural only | Low–medium | Excellent | Low–medium | Excellent | Excellent | Phase 0, fallback, all instanced dynamics |
+| B. Blender-authored | Medium–high (skill-dependent) | Excellent | High | Good with scripted builds | Excellent | Backbone and mechanism authoring |
+| C. Meshy direct use | High surface detail | Poor without cleanup | Low per asset, medium with cleanup | Poor | Plan-dependent | Props, textures, figure, look-dev |
+| D. Hybrid Blender + Meshy | High | Excellent after cleanup | Medium | Good if outputs are versioned | Good with a manifest | Recommended target from Phase 1 onward |
+
 ## 13. Guided Scenario Catalogue
 
 The article supplies a strong first curriculum. Synthetic sessions can make each state
@@ -756,6 +968,11 @@ and comparison UX before arbitrary live apps are supported.
 - Build two throwaway inside-phone prototypes from the same recording: a fixed shallow-3D
   diorama and a limited-parallax interior. Give both the same small trace/evidence drawer
   and test comprehension, not visual preference alone.
+- Run a small look-development spike (see §12.8): render the fixed diorama in three
+  treatments from the same recording—procedural only, Blender-authored, and Blender
+  blockout with Meshy texturing/props—and record effort, cleanup time, credit cost,
+  viewer frame time, download size, and whether richer surfaces help or hinder
+  recognition of queueing and missed frames.
 - Prove phone-to-relay-to-laptop pairing over HTTPS/WSS and deliberately test network loss
   and page backgrounding.
 
@@ -764,6 +981,7 @@ is represented honestly; the probe meets or revises an agreed overhead budget; a
 visual concept communicates queueing and a missed frame without explanation from its
 author. Test participants should also recognize that they are inside a phone looking
 through the back of its screen toward the holder without needing a long introduction.
+An asset approach is chosen for Phase 1, with a first draft of the asset contract.
 
 ### Phase 1 — Recorded vertical slice
 
@@ -772,6 +990,9 @@ through the back of its screen toward the holder without needing a long introduc
 - Final upload, session list, replay, scrub, pause, step, and one interaction detail view.
 - Shallow-3D inside-phone overview, reversed generic app surface, recorded touch pulse,
   internal main-thread machinery, and a synchronized conventional timeline.
+- Asset pipeline v1: scripted Blender export, glTF optimisation step, naming-contract
+  validator, asset manifest, and at least the chassis and main-thread mechanisms in the
+  chosen treatment, with the procedural fallback kept in parity.
 - Two deterministic teaching scenarios and an A/B comparison view.
 
 **Exit gate:** a user can record a real interaction on a target phone, open the result on
@@ -806,6 +1027,8 @@ high-fidelity trace of the same journey and explain their coverage differences.
 - Guided annotations, narration, synchronized A/B playback, bookmarks, and export.
 - Refine the outside holder, hands, screen-back material, inner chassis, authored camera
   moves, pulse/vibration language, and side-by-side handset comparison.
+- Full hybrid asset pass: Meshy-assisted texturing and props unified in Blender, rigged
+  stylized holder with a touch pose, LODs, KTX2 textures, and style-consistency review.
 - Accessibility: reduced motion, keyboard controls, non-color encodings, text/table
   equivalents, and screen-reader-readable metric summaries.
 - Visual performance hardening and low-end viewer fallback.
@@ -830,6 +1053,11 @@ honest entry point into the captured diagnostic detail.
 | Mobile lifecycle loses the final upload | OS may terminate hidden pages quickly | Small acknowledged chunks after capture; Beacon only as best effort; surface incomplete sessions |
 | CDP becomes a Chromium lock-in | It offers tempting detail unavailable elsewhere | Adapter boundary; portable public-API core; label fidelity rather than flattening it |
 | The visualizer itself janks | Event-rich animation can overwhelm the companion | Frame-coalesced rendering, LOD, object caps, worker parsing, replay segment loading, its own perf harness |
+| Rich assets drown the telemetry | Detailed textures and glow compete with queue halos, strain, and missed-frame cues | Reserve emissive/saturated channels for data; detail gradient away from the main line; comprehension test in the look-dev spike |
+| Generated assets are unusable as delivered | Dense, unsegmented meshes with baked lighting cannot be bound to telemetry or rendered cheaply | Use Meshy for surfaces/props only; mandatory Blender cleanup, naming validation, and glTF optimisation |
+| Asset style drifts | Separately generated props look like a kit-bash rather than one device | Style reference board, fixed prompt vocabulary, shared trim sheets, and a Blender unification pass |
+| Asset licensing or provenance is unclear | Free-plan Meshy outputs are public CC BY 4.0; AI-output copyright is unsettled; attribution can be lost | Paid plan for private work, asset manifest with source/licence/attribution, confirm terms before release |
+| Art pipeline consumes the project | Look-development can absorb far more time than telemetry work | Time-boxed look-dev spike; procedural fallback always works; enhance assets incrementally after the recorded slice |
 | Scores become the product | One number hides cause and context | Preserve individual interactions, session chronology, RAIL context, and causal drill-down |
 
 ## 17. Decisions to Make After Discovery
@@ -844,6 +1072,9 @@ honest entry point into the captured diagnostic detail.
 | Outside holder style | Silhouette; low-poly person; detailed character; camera feed | Neutral silhouette or softly shaded low-poly figure; no camera feed |
 | Internal visual language | Dispatch machinery; literal circuit board; abstract organism | Dispatch machinery embedded in a stylized chassis |
 | Renderer | Three.js/R3F; custom WebGL/WebGPU; Canvas fallback | Spike Three.js/R3F plus a schematic fallback; avoid a game/physics engine commitment in Phase 0 |
+| Asset pipeline | Procedural only; Blender-authored; Meshy direct; hybrid Blender + Meshy | Procedural for Phase 0; hybrid Blender + Meshy from Phase 1 if the look-dev spike shows richer assets aid rather than hinder comprehension |
+| Visual style | Brushed industrial; bioluminescent/organic; clean ceramic; warm retro-electronics | Choose from look-dev variants; keep telemetry channels reserved whatever the style |
+| Meshy plan | Free (public, CC BY 4.0); paid (private, API access) | Paid plan if assets ship or API/MCP automation is used; free only for throwaway exploration |
 | Primary scope | Runtime interaction/animation; initial load; memory/network | Runtime interaction and animation first |
 | Utilization semantics | Public-API lower bound; app-instrumented share; exact trace accounting | Show all when available, never collapse them into one unlabeled number |
 | Live transport | WebSocket both ways; POST ingest + SSE fan-out; WebRTC direct | Simple relay; choose transport after payload/latency spike |
@@ -893,8 +1124,13 @@ The first meaningful release is successful when:
 5. Produce two low-cost inside-phone studies—a fixed shallow-3D diorama and a
    limited-parallax version—driven by the identical JSON recording and sharing the same
    trace drawer.
-6. Measure probe overhead and revise the provisional budgets before building the relay.
-7. Implement the recorded vertical slice. Add the one-Hz live summary only after the
+6. Time-box a look-development spike: assemble a style reference board, block out the
+   chassis and main-thread mechanisms in Blender, texture one variant with Meshy and
+   generate two or three props, then compare it with the procedural version for
+   comprehension, viewer performance, and cleanup effort. Draft the asset contract and
+   manifest from what the spike reveals.
+7. Measure probe overhead and revise the provisional budgets before building the relay.
+8. Implement the recorded vertical slice. Add the one-Hz live summary only after the
    recorded path is useful and the overhead gate passes.
 
 The default path should change only when these spikes produce contrary evidence. In
@@ -919,3 +1155,11 @@ that could obscure the main-thread scheduling story.
 - [Page Visibility API](https://developer.mozilla.org/en-US/docs/Web/API/Page_Visibility_API)
 - [Beacon specification](https://w3c.github.io/beacon/)
 - [Safari Web Inspector](https://developer.apple.com/documentation/safari-developer-tools/web-inspector)
+- [Meshy API documentation](https://docs.meshy.ai/en)
+- [Meshy asset licensing and commercial use](https://help.meshy.ai/en/articles/9992001-can-i-use-my-generated-assets-for-commercial-projects)
+- [Meshy pricing](https://www.meshy.ai/pricing)
+- [Blender glTF 2.0 exporter](https://docs.blender.org/manual/en/latest/addons/import_export/scene_gltf2.html)
+- [Blender Python API](https://docs.blender.org/api/current/)
+- [glTF Transform](https://gltf-transform.dev/)
+- [Three.js GLTFLoader](https://threejs.org/docs/#examples/en/loaders/GLTFLoader)
+- [Poly Haven](https://polyhaven.com/) and [ambientCG](https://ambientcg.com/) CC0 materials and HDRIs
