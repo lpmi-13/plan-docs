@@ -19,6 +19,8 @@ The core promise is:
 
 The scene must be visually striking, but the spectacle serves a conceptual model: each visual element maps to a real kernel or runtime structure, is labeled as either **modeled** or **measured**, and has a "ladder" down to the command an engineer would run to see it on a real machine.
 
+A further option, explored in Section 13, is to record a real Gunicorn startup as an ordered log of kernel events with eBPF and let the learner step through it one `fork()`, import, and page fault at a time.
+
 ## 2. Why This Matters to an Engineer Supporting Production
 
 Most Python web services in production run under a pre-fork server (Gunicorn, uWSGI) and often alongside a pre-fork task runner (Celery's default prefork pool). Many incidents that look mysterious — memory that creeps up for hours without a leak, dashboards that report three times more memory than the node is using, SSL errors that appear only after a "harmless" performance setting, cache clears that do not stick — are direct, predictable consequences of `fork()`.
@@ -230,7 +232,7 @@ The course uses concreteness fading. Every visual element starts as an intuitive
 | Cable from deck port to a buoy | Descriptor referencing a shared kernel object | `/proc/<pid>/fd`, `ss -tnp`, `lsof` |
 | Fence around the floor | Container memory limit | cgroup `memory.max`, `memory.current` |
 
-The scene never shows a metaphor without making the next rung one click away.
+The scene never shows a metaphor without making the next rung one click away. When a recording includes an eBPF trace, a fourth rung is available: the individual kernel event that caused the change (Section 13.8).
 
 ### 5.7 Instructional loop
 
@@ -276,10 +278,12 @@ The visuals can be accurate while the narration teaches a misconception. Authors
 - Prediction capture, self-explanation with rubrics, a concept map builder, and a pre/post concept inventory.
 - A first-class 2D "flat mode" that renders the same world state without WebGL, for accessibility and low-power devices.
 - Progress stored locally in the browser, with export and import.
+- *Conditional on spike S5:* eBPF-traced startup recordings of the reference application and a Trace replay mode for stepping through them (Section 13).
 
 ### 6.2 Deferred extension tracks
 
 - **Live lab mode:** connect the browser to a learner-run Docker Compose stack and visualize a live Gunicorn deployment.
+- **Record your own application:** a packaged eBPF recorder that captures a service's startup in staging and opens it locally in Forkscape with a fork health report (Section 13.9).
 - **Threads and locks drill:** a background thread started at import time deadlocks or silently disappears in workers.
 - **Deploy and reload drill:** `HUP` versus `USR2` versus a full restart, with and without preload.
 - **Timeouts and respawn drill:** heartbeat files, `worker_tmp_dir`, and boot cost under load.
@@ -426,6 +430,7 @@ On narrow screens the scene takes the full width, and the lesson rail, inspector
 | Sandbox | Model engine calibrated to recorded runs | Free experimentation with Gunicorn settings and workloads |
 | Replay | Recorded run bundles | Scrub any recorded run with all panels linked |
 | Drill | Recorded runs with hidden labels | Evidence-led incident practice |
+| Trace replay | eBPF-traced recordings (Section 13) | Step through a real startup one kernel event, import, or fork at a time |
 
 ### 8.3 Sandbox controls
 
@@ -466,7 +471,7 @@ All panels subscribe to a single selection and time cursor. Selecting a worker d
 - Results overlay the prediction on the outcome rather than replacing it.
 - Self-explanations are compared with a model answer and a three-to-five item rubric checklist that the learner ticks honestly.
 - Learners optionally rate confidence; the summary highlights confident-but-wrong predictions as the most valuable review targets.
-- The concept inventory (Section 14.5) runs before Module 1 and after Module 10.
+- The concept inventory (Section 15.5) runs before Module 1 and after Module 10.
 
 ## 9. Visual Design North Star: Glass Decks over a Memory Floor
 
@@ -538,9 +543,10 @@ At Z0–Z1 a tile may represent many pages; the legend always states the current
 | --- | --- | --- | --- |
 | **Model engine** | Exact page-table, frame, and copy-on-write semantics for a small simplified system; a simplified CPython heap; the arbiter state machine | Real sizes, real timings, exact CPython object layout | Modules 1–5, Z3 page interior, sandbox |
 | **Recorded run** | Real per-process memory figures, per-page shared/exclusive state at keyframes, minor-fault counts, Gunicorn events, request outcomes, replayed command output | Behavior on other kernels, Python versions, or hardware; causality not supported by the evidence | Modules 0 and 6–10, drills, calibration |
+| **Event trace** (eBPF, Section 13) | Exact order and timing of observed kernel and runtime events; fault addresses and flags; socket and thread evidence; per-page state reconstructed from events and reconciled against snapshots | Complete state between checkpoints across a gap; frame identity unless captured; Python attribution without a sampled stack | Trace replay, Modules 6–8, Drill D2 |
 | **Live lab** (post-MVP) | The learner's own deployment in real time | More precision than its sampling rate | Extension track |
 
-The model engine is calibrated against recorded runs: its parameters (shared pages after boot, pages dirtied per request type, the fraction of heap pages touched by a full collection) are fitted to captures, and CI checks that the model stays within tolerance of the recorded results (Section 14.2).
+The model engine is calibrated against recorded runs: its parameters (shared pages after boot, pages dirtied per request type, the fraction of heap pages touched by a full collection) are fitted to captures, and CI checks that the model stays within tolerance of the recorded results (Section 15.2).
 
 ## 11. Technical Architecture
 
@@ -561,6 +567,7 @@ The model engine is calibrated against recorded runs: its parameters (shared pag
 
 Offline, on a reference Linux host:
   capture harness ── Django + Gunicorn + PostgreSQL + load driver + /proc sampler
+                  │                                   + eBPF recorder (Section 13)
                   └─► versioned capture bundles ──► published with the static site
 ```
 
@@ -640,6 +647,7 @@ A Python project that runs a real deployment on a reference Linux host and produ
 - **`db`:** PostgreSQL with TLS enabled, so the inherited-connection drill reproduces realistic error messages.
 - **`driver`:** a deterministic, seeded load driver per scenario; requests and responses are logged with worker PIDs.
 - **`sampler`:** a separate process that shares the app's PID namespace and reads, per process, `smaps_rollup`, `status`, `stat` (minor and major faults), the process tree, thread counts, and descriptor targets at a configurable rate. At keyframes and after notable events it reads `/proc/<pid>/pagemap` for selected regions to record per-page present/exclusive state. On privileged reference runs it also records frame numbers and `/proc/kpagecount` to draw exact filaments. It reads the container's cgroup `memory.current` and `memory.stat`. Optionally, it clears and reads soft-dirty bits around a single request to show exactly which pages that request wrote.
+- **`recorder`** (conditional on spike S5): an eBPF recorder that launches Gunicorn, traces process lifecycle, signals, address-space changes, page faults, sockets, and CPython import and GC markers, and pauses at fork checkpoints so the sampler can take consistent snapshots (Section 13).
 - **`commands`:** at keyframes the harness also runs the real commands shown in the replayed terminal (`ps --forest`, `cat /proc/<pid>/smaps_rollup`, `smem`, `ss -tnp`) and stores their exact output.
 - **`bundler`:** normalizes everything into a bundle, validates it against the schema, and writes a manifest.
 - **Observer effect:** the sampler runs outside the workers; instrumentation inside workers is limited to small datagrams; each canonical scenario is also run with the sampler at a low rate to confirm the effects do not depend on observation.
@@ -655,6 +663,7 @@ bundle/
   pages/<t>/<pid>.bin    # per-page state arrays for selected regions at keyframes
   terminal/<t>.json      # exact command outputs at keyframes
   checks.json            # scenario assertions and results
+  trace/                 # optional eBPF event trace, deltas, and keyframes (Section 13.6)
 ```
 
 ```json
@@ -716,12 +725,211 @@ About a dozen runs, each a few minutes long with optional long-run variants for 
 10. OOM under a container limit (D1 "before"), and the fixed configuration (D1 "after").
 11. Inherited database connection (D2 "before" and "after").
 12. `LocMemCache` and Prometheus counters (D3 "before" and "after").
+13. *Conditional on spike S5 (Section 13.10):* an eBPF-traced startup, with and without preload, from `exec` through the first ten requests.
 
 Every scenario carries machine-checkable assertions (for example, "after preload, more than half of each worker's anonymous memory is shared at boot" or "after `/scan` × N, private dirty memory exceeds the `/lookup` case by a stated factor"), with thresholds set from repeated runs during Phase 0.
 
-## 13. Accessibility and Performance
+## 13. Recording Real Telemetry with eBPF and Stepping Through It
 
-### 13.1 Accessibility
+The model engine shows the mechanism, and the `/proc` sampler shows real state at the moments it samples. Neither shows **every step, in order, as the kernel performed it**. Gunicorn startup is an ideal window for that level of detail: it is short, bounded, and contains nearly every event this course teaches — `exec`, socket creation, imports, the growth of the heap, each `fork()`, the first post-fork writes, and the first lazy imports in each worker.
+
+This section describes what would be needed to record a real startup as an ordered log of kernel and runtime events using eBPF, and then step through that log in Forkscape with the same decks, filaments, and ledger, driven entirely by what the kernel reported.
+
+A note on terms: eBPF **profilers** (Parca, Pyroscope, the OpenTelemetry eBPF profiler) periodically sample call stacks and are built to answer "where is time going?". Step-through replay needs eBPF **tracing**: recording each relevant event as it happens. The two complement each other. Tracing supplies the ordered events; profiling-style stack capture can say which Python code was running when a sampled event occurred.
+
+### 13.1 What the replay should let a learner do
+
+- Step forward and backward through the startup at a chosen granularity: kernel event, fault batch, system call, Python import, garbage collection, signal, Gunicorn hook, fork, or request.
+- Watch the master's heap grow import by import, the listening socket appear, each worker deck get printed at its real `fork()`, each worker's first private pages appear, and lazy imports land in worker memory after the first request.
+- Select any event to see its raw record: the hook that produced it, its fields, its timestamp, the process and thread, and a Python stack where one was sampled.
+- See exactly where the recording is incomplete (dropped events, hooks that could not attach) and where a snapshot corrected the reconstructed state.
+- Compare two recordings aligned at the first `fork()` — for example, preload on and off.
+
+A traced, preloaded startup of the reference application would be expected to read like this:
+
+| Step | Phase | Kernel and runtime evidence | Scene |
+| --- | --- | --- | --- |
+| 1 | `exec` of Gunicorn | `sched_process_exec`; `mmap` of the interpreter and shared libraries | The arbiter deck appears; file-backed regions map to page-cache frames |
+| 2 | Configuration and bind | `socket`, `bind`, and `listen` system calls | The listening-socket buoy appears with one cable |
+| 3 | Preload imports | CPython import markers; `brk`/`mmap`; first-touch page faults | The heap zone grows module by module, labeled with module names |
+| 4 | Import-time side effects | `connect` to the database port; a `clone` that creates a thread | Warnings: a database cable and an extra thread spindle exist before the fork |
+| 5 | Pre-fork hook | Hook event; GC markers for `gc.freeze()`; `close` of the database socket | Frozen objects grey out; the database cable is removed |
+| 6 | `fork()` × N | `sched_process_fork` and `clone` returns; a checkpoint snapshot | Decks are printed; filaments land on existing frames; page-table sheets appear |
+| 7 | Worker initialization | `post_fork` hook event; first write faults in each worker | The first copy-on-write breaks: the real post-fork baseline cost of un-sharing |
+| 8 | Ready | Workers blocked in `accept4`/`epoll_wait` | Idle workers ring the socket well |
+| 9 | First requests | `accept4` returns; import markers in worker processes; write faults with sampled stacks | Private pages from lazy imports, attributed to the modules that caused them |
+
+### 13.2 Telemetry sources and what each contributes
+
+| Concern | Hook (preferred → fallback) | What it provides | Limits and notes |
+| --- | --- | --- | --- |
+| Process lifecycle | Tracepoints `sched:sched_process_fork`, `sched:sched_process_exec`, `sched:sched_process_exit`; `task:task_newtask` for clone flags; `clone`/`clone3` system-call exits | Parent and child IDs, thread versus process, `fork()` return in parent and child, timestamps | Stable tracepoints. `sched_process_fork` also fires for new threads, so clone flags or thread-group IDs must classify each event |
+| Signals | `signal:signal_generate`, `signal:signal_deliver` | `SIGCHLD`, `SIGTERM`, `SIGABRT`, `SIGKILL`, `SIGHUP`, `SIGTTIN`/`SIGTTOU` between arbiter and workers | Stable |
+| Address-space changes | System-call tracepoints for `mmap`, `munmap`, `mremap`, `brk`, `mprotect`, `madvise` | Region creation, growth, and removal; flags such as `MADV_DONTFORK` | The allocator returns memory with `madvise` and `munmap`; process exit removes everything at once |
+| Page faults | `fentry`/`kprobe` on `handle_mm_fault` → `exceptions:page_fault_user` and `exceptions:page_fault_kernel` (x86-64 only) | Every fault with address and flags (write, user, remote); on x86 the error code also says whether the page was present | `handle_mm_fault` also sees faults taken on a process's behalf by the kernel. The exception tracepoints miss those and do not exist on arm64 |
+| Copy-on-write outcome | Optional `kprobe`s on memory-management internals that copy or reuse a write-protected page | Distinguishes copy, reuse of an exclusive page, and copy from the shared zero page | Internal functions are not a stable interface, may be inlined, and differ by kernel version; the recorder must detect availability and fall back to classification by reconstruction |
+| Physical frames | `kmem:mm_page_alloc`/`kmem:mm_page_free`, or frame numbers from privileged `pagemap` reads | Exact frame identity for exact filaments | High volume and privileged; optional |
+| Descriptors and sockets | System-call tracepoints for `socket`, `bind`, `listen`, `accept4`, `connect`, `close`, `dup*`; `kprobe`s on TCP send and receive paths keyed by the kernel socket object | Which processes use which kernel socket — directly detects two workers using one database connection | Kernel object addresses must be replaced with per-recording hashed identifiers before leaving the recorder |
+| Memory pressure and OOM | `oom:mark_victim`; cgroup `memory.events` | Victim process and timing | Stable |
+| CPython runtime | USDT markers: `import__find__load__start`/`done`, `gc__start`/`done` | Module names for imports; garbage-collection generations and timing | Requires CPython built with `--with-dtrace`; per-function markers are too costly and are not used |
+| Python stacks | User-stack capture with frame pointers plus perf maps from `python -X perf` (3.12+), or an interpreter-aware eBPF unwinder | Which Python code was running when a sampled fault occurred | Sample rather than capture per event; the perf map must be valid in forked workers |
+| Gunicorn semantics | Existing server hooks over a Unix datagram socket (Section 11.6) | `pre_fork`, `post_fork`, `worker_abort`, `child_exit`, and others | User space, timestamped with the same monotonic clock as eBPF |
+| Ground truth | `/proc/<pid>/maps`, `smaps_rollup`, and `pagemap` at checkpoints (not eBPF) | Authoritative per-page state | See Sections 13.3 and 13.4 |
+
+### 13.3 Event-sourced reconstruction
+
+eBPF reports **changes**, not **state**. The replay is therefore built like a video stream: a few complete snapshots (keyframes) plus an ordered stream of changes (deltas) between them.
+
+Per-page reconstruction rules:
+
+- `exec` starts a process with no anonymous pages; file mappings come from `mmap` events.
+- A first-touch write fault on an anonymous page creates a private present page. A first-touch read fault maps the kernel's shared zero page.
+- `fork()` gives the child a copy of the parent's page-state table. Every present private anonymous page becomes shared and write-protected in both processes, and its sharer count increases.
+- A write fault on a present, write-protected page gives the writer a private copy and decrements the original's sharer count, unless the writer was the last sharer, in which case the page is reused without a copy.
+- `munmap` and process exit remove pages and decrement sharer counts.
+
+Places where these rules are wrong, and which the reconciler must account for:
+
+- **Zero page.** A write after a read of a never-written page is a write-protect fault with no other process involved. It is not a broken share.
+- **Fault-around.** One read fault on a file-backed mapping can map several neighboring pages.
+- **Transparent huge pages.** One fault can map many pages; background collapse changes mappings with no user fault; copy-on-write of huge pages behaves differently across kernel versions.
+- **Changes without user faults.** Reclaim, swap, migration, compaction, and same-page merging alter pages without any user fault.
+- **Fork flags.** Regions marked `MADV_DONTFORK` or `MADV_WIPEONFORK` are not inherited normally.
+- **Allocator returns.** `MADV_DONTNEED`/`MADV_FREE` from the allocator drop pages that must later fault in again.
+- **Lost events.** Drops create gaps in which state is unknown.
+
+**Reconciliation.** At every checkpoint the reconciler compares reconstructed state with the `pagemap` snapshot, counts differences by category, and lets the snapshot win. The replay shows a "reconstruction corrected here" marker with the size of the drift. The rule set is improved until drift is below an agreed threshold on the canonical scenarios. Pages whose state is unknown after a gap are drawn desaturated with a dotted outline rather than guessed.
+
+### 13.4 Checkpoints: a consistent picture at the moment of fork
+
+Reading `/proc` after a fork event races with the processes, which keep running. Three options, from most to least precise:
+
+1. **Fork barrier (lab only).** A BPF program on the `clone` exit in the child (return value 0) calls `bpf_send_signal(SIGSTOP)`, so the child stops before running any user code. The parent can be stopped the same way on its own `clone` exit. The recorder snapshots both and sends `SIGCONT`. An alternative attach point is a uprobe on CPython's after-fork child handler, which stops the child at a well-defined user-space point.
+2. **cgroup v2 freezer.** Writing `1` to the application cgroup's `cgroup.freeze` stops every process in the container. The recorder snapshots all of them and thaws. This is consistent across processes but happens slightly after the event.
+3. **No pause.** Snapshot as fast as possible and label the checkpoint "approximate, n ms after the event".
+
+Pausing changes timing. Gunicorn's arbiter compares worker heartbeat timestamps with the current time, so a freeze longer than `timeout` can cause it to abort workers after the thaw. Checkpoint recordings therefore raise `timeout`, record every pause duration in the bundle, and replay on a pause-compensated timeline. Checkpoint pauses are a lab and staging technique and are never used in production.
+
+### 13.5 Recorder design
+
+- **Tooling progression.** Prototype with `bpftrace`, which iterates quickly, can launch the target with `-c`, and emits JSON. Build the repeatable recorder as libbpf CO-RE programs with a small Go or Rust user-space loader, using the BPF ring buffer and BTF for portability across kernels. BCC is fine for experiments but compiles at runtime and needs kernel headers. Existing tools cover parts of the problem — Tetragon for process lifecycle, `perf trace` for quick checks, eBPF profilers for stacks — but none records page-level fork and copy-on-write state, so a purpose-built recorder is needed.
+- **Scope in the kernel.** The recorder launches Gunicorn itself, or targets the application's cgroup ID. It tracks descendants in a BPF hash map that is updated on every fork, and drops all other events in the kernel.
+- **Bounded window.** Record from `exec` until every worker is ready, plus a configurable tail (for example, the first K requests). Enforce a time limit and an event budget, then detach automatically.
+- **Adaptive detail.** Record every event during startup. If the fault rate passes a threshold, switch to per-process, per-region histograms in short intervals plus sampled per-event records, and mark the switch in the bundle.
+- **Fault record.** Timestamp, process and thread, page-aligned address, flags (write, user or kernel, present when known), region identifier, and outcome (new, copy, reuse, zero-page copy) when internal hooks are available.
+- **Drops.** Per-CPU drop counters become explicit gap events. Gaps are not hidden.
+- **Clock.** `bpf_ktime_get_ns()` and Python's `time.monotonic_ns()` both read `CLOCK_MONOTONIC`, so kernel events, Gunicorn hooks, and request middleware share one timeline unless a time namespace is in use.
+- **Identity.** eBPF sees host process IDs, while the application sees IDs from its own PID namespace. The recorder records both mappings (for example, from `NSpid` in `/proc/<pid>/status`) and hashes kernel object addresses with a per-recording key.
+- **Preflight and attachment honesty.** Reuse the preflight checklist from `BPF_EXPLORATION_PLAN.md` (BTF, capabilities, lockdown, tracefs and BPF filesystem mounts) and its rule that a run must distinguish "no matching event" from "probe did not attach" and "events were lost". The bundle lists which hooks attached and which fell back.
+
+An illustrative Phase 0 spike, to be validated on the reference kernel:
+
+```text
+// bpftrace -c 'gunicorn -c gunicorn.conf.py config.wsgi' forkspike.bt
+BEGIN { @tracked[cpid] = 1; }
+
+tracepoint:sched:sched_process_fork /@tracked[pid]/ {
+  @tracked[args->child_pid] = 1;
+  printf("{\"t\":%llu,\"ev\":\"fork\",\"parent\":%d,\"child\":%d}\n",
+         nsecs, pid, args->child_pid);
+}
+
+// x86-64 error code: bit 0 = page present, bit 1 = write.
+// Present + write = copy-on-write candidate (or zero-page copy; see Section 13.3).
+tracepoint:exceptions:page_fault_user /@tracked[pid]/ {
+  if ((args->error_code & 3) == 3) { @cow_candidates[pid] = count(); }
+  else { @other_faults[pid] = count(); }
+}
+```
+
+The spike only counts faults per process; the real recorder emits each event to the ring buffer.
+
+### 13.6 Bundle additions
+
+A traced recording extends the bundle format in Section 11.7:
+
+```text
+bundle/
+  trace/
+    events/            # columnar binary chunks: one typed array per field, per event type
+    deltas/            # pre-reconstructed per-page state changes, chunked by time
+    keyframes/<n>/     # full reconstructed state plus the checkpoint snapshot it was reconciled with
+    gaps.json          # dropped-event ranges and pause durations
+    probes.json        # kernel features detected, hooks attached, fallbacks used
+    symbols/           # module names and perf maps needed to render sampled stacks
+```
+
+A preloaded master whose heap grows by a few hundred MiB first-touches tens of thousands of pages. With a few dozen bytes per event, a startup trace is likely to be megabytes to low tens of megabytes before compression; spike S5 measures the real figure. Larger recordings are streamed in chunks rather than loaded at once.
+
+### 13.7 Replay engine and stepping interface
+
+- **Reconstruct once, offline.** The bundler performs reconstruction and reconciliation in one tested implementation and ships both the raw events and pre-computed per-page deltas. The browser only applies deltas, which keeps it fast and avoids two implementations of subtle rules drifting apart.
+- **Seeking.** Seek to the nearest keyframe and apply deltas forward. Stepping backward is a seek to the previous position. Keyframes are placed at checkpoints and every N events.
+- **Startup phases.** The timeline groups events into labeled bands (`exec`, configuration, bind, preload imports, fork, worker initialization, ready, first requests), so a learner can jump by phase before stepping by event.
+- **Event inspector.** Shows raw fields, the hook that produced the event, its confidence, and related events: the `mmap` that created the faulting region, the import in progress when the fault happened, and the nearest sampled Python stack.
+- **Automatic findings.** Derived from the trace and shown as annotations:
+  - threads alive in the master at the moment of fork;
+  - non-listening sockets open at fork;
+  - kernel sockets used by more than one process after the fork;
+  - imports that happen in workers after the fork;
+  - time from fork to ready for each worker;
+  - pages un-shared by each worker's first request.
+- **Comparison.** Two recordings can be aligned at the first fork, with ledger differences per phase.
+- **Honest rendering.** The scene draws only state backed by reconstruction or a checkpoint. Unknown pages are visibly unknown, and every frame of the replay names its source hooks.
+
+### 13.8 Where traces fit the curriculum and the framework
+
+- **Representation ladder.** Traces add a fourth rung below metaphor, mechanism, and measurement: the individual kernel event that caused the change. For example, a snapping filament corresponds to a write fault on a present page, at a specific address, from a specific process.
+- **Module 6.** "Step through a real startup" replaces the scripted boot with the traced one; the learner predicts each phase before stepping through it.
+- **Module 7.** Preload on and off are compared side by side at the first fork; lazy imports after the first request are attributed to module names.
+- **Module 8.** First-request copy-on-write faults are shown with sampled Python stacks, making "reading is writing" concrete in real code.
+- **Drill D2.** The trace shows `connect` in the master before the fork and two worker processes sending on the same kernel socket afterward, which is the strongest possible evidence for that incident.
+- **Learner experience.** A **Trace replay** mode is added to Section 8.2.
+
+### 13.9 Recording your own application (post-MVP)
+
+The same recorder could let engineers record **their own service's startup**, for example in staging, and open it in Forkscape. This is a strong bridge from the course to their production systems.
+
+- **Packaging.** A privileged CLI or container that launches the server (`forkscape-record -- gunicorn myproject.wsgi -c gunicorn.conf.py`), or attaches to a cgroup before a service restart.
+- **Local-only analysis.** The resulting bundle is dragged into the browser and parsed there. Nothing is uploaded.
+- **Output.** Generic replay views plus a "fork health report" built from the automatic findings in Section 13.7 and the shared fraction at ready.
+- **Where it works.** Self-managed VMs and Kubernetes nodes where a privileged agent (`CAP_BPF` and `CAP_PERFMON`, sometimes `CAP_SYS_ADMIN`) can run on a BTF-enabled kernel.
+- **Where it does not.** Many managed container platforms do not allow eBPF at all. There, a sampler-only recording of `/proc` (which needs only access to the application's own processes) still provides the coarser replay.
+- **Privacy and safety.**
+  - Never record memory contents; record addresses, sizes, and flags only.
+  - Redact command lines, environment variables, file paths, and peer addresses by default, and hash kernel addresses.
+  - Make Python stack capture opt-in, because stacks reveal code structure.
+  - Bound the duration and abort if drop rates or latency inflation exceed limits.
+  - Never use checkpoint pauses outside lab mode.
+
+### 13.10 Spike S5: feasibility questions
+
+1. Can every fork, thread creation, and signal in the Gunicorn process tree be captured from `exec` to ready with zero drops?
+2. Do write faults on present pages, after accounting for zero-page and fault-around effects, match copy-on-write counts derived from `pagemap` snapshots within an agreed tolerance?
+3. Which fault hooks attach on the reference kernel (`handle_mm_fault` via `fentry`, exception tracepoints, internal copy-on-write functions), and which are inlined or missing?
+4. How much do startup time and first-request latency inflate with full fault tracing? The working budget is 20% for lab recordings, to be confirmed or revised from measurements.
+5. Does the fork barrier stop the child before user code in practice, and does Gunicorn behave correctly with a raised timeout?
+6. Can a CPython build with DTrace markers and frame pointers, run with `-X perf`, provide import attribution and Python stacks inside forked workers?
+7. What are the event volume and compressed bundle size for the reference startup plus 100 requests?
+8. Does the recorder work unchanged on the reference VM, on VM 1 of the eBPF exploration playground, and on a Docker Desktop VM?
+
+**Exit criteria:** zero unexplained drops during startup; reconciliation drift below the agreed threshold at every checkpoint; overhead within budget; the fork and import events of the reference startup render correctly in a throwaway replay view.
+
+### 13.11 Options compared and recommendation
+
+| Approach | Strengths | Weaknesses |
+| --- | --- | --- |
+| `/proc` sampler only | Portable, low privilege, simple; authoritative state at each sample | Coarse in time; no event ordering; no attribution |
+| eBPF event trace plus checkpoints | Exact ordering, step-through replay, socket and thread evidence, import and stack attribution | Needs privileges and kernel features; internal hooks vary by kernel; reconstruction needs careful reconciliation |
+| `strace`/`ptrace` | Portable; easy to explain | Heavy overhead that perturbs timing; sees system calls but not page faults |
+| `perf trace` or `perf record` | Good for quick checks of the same tracepoints | Less programmable filtering and aggregation; harder to package |
+| LTTng | Strong combined kernel and user-space tracing | Heavier setup; less common in container fleets |
+
+**Recommendation:** treat an eBPF-traced startup as the "gold" recording of the reference application's boot. Run spike S5 in Phase 0. If it passes, include traced startups with and without preload (scenario 13) in Modules 6–7 and Drill D2 as part of the MVP, and ship Trace replay mode. Keep the `/proc` sampler as the portable baseline and as the ground truth for reconciliation. Defer recording your own application to post-MVP.
+
+## 14. Accessibility and Performance
+
+### 14.1 Accessibility
 
 - Flat mode parity: every lesson, prediction, and drill is completable without WebGL.
 - Keyboard navigation for selection, camera presets, time controls, and all panels; visible focus.
@@ -730,16 +938,16 @@ Every scenario carries machine-checkable assertions (for example, "after preload
 - Color is never the only channel (Section 9.4); contrast meets WCAG AA in all themes.
 - Captions for any optional audio; sound off by default.
 
-### 13.2 Performance budgets
+### 14.2 Performance budgets
 
 - First meaningful scene (Module 1) interactive in under five seconds on a mid-range laptop with a cold cache.
 - 60 fps target on a reference integrated GPU at Z0–Z2 with up to roughly 250,000 visible tiles; adaptive quality before dropping below 30 fps.
 - Draw calls under 100 in typical shots.
 - Initial JavaScript under a stated budget; three.js, the engine, and bundles loaded per route.
 
-## 14. Testing and Validation
+## 15. Testing and Validation
 
-### 14.1 Engine tests
+### 15.1 Engine tests
 
 - Unit tests for every kernel, descriptor, thread, CPython, and arbiter operation.
 - Property-based tests for invariants:
@@ -750,24 +958,24 @@ Every scenario carries machine-checkable assertions (for example, "after preload
   - descriptor reference counts match the processes holding them;
   - the same seed always produces the same event stream.
 
-### 14.2 Calibration tests
+### 15.2 Calibration tests
 
 For each canonical recorded scenario, run the calibrated model and assert that key outcomes (shared fraction at boot, private growth per request type, decay saturation level, ΣPSS against cgroup memory) fall within a tolerance band derived from capture variance. CI fails when a model change drifts outside the band.
 
-### 14.3 Bundle and replay tests
+### 15.3 Bundle and replay tests
 
 - Schema validation for every bundle.
 - Replay determinism: replaying a bundle produces the same sequence of world-state hashes.
 - Capture reproducibility: canonical scenarios are re-run several times on the reference host; lessons only claim effects larger than the observed variance.
 
-### 14.4 Interface tests
+### 15.4 Interface tests
 
 - Playwright end-to-end tests that complete every module in both 3D and flat modes.
 - Screenshot tests for key camera shots in all themes and in reduced-motion mode.
 - Automated accessibility checks on the 2D interface, plus a manual screen-reader pass per release.
 - Renderer budget checks using renderer statistics (instance counts, draw calls) in CI, and manual frame-time checks on reference devices.
 
-### 14.5 Learning validation
+### 15.5 Learning validation
 
 - **Concept inventory:** 12–15 items targeting the misconceptions in Section 5.5, used before and after. Example items:
   - "Immediately after a 300 MiB process forks, roughly how much additional physical memory is in use?"
@@ -779,7 +987,7 @@ For each canonical recorded scenario, run the calibrated model and assert that k
 - **Transfer task:** from unseen `smaps_rollup` output for one master and four workers, estimate total memory within 15% and recommend a worker count for a stated limit.
 - **Targets for the pilot:** at least 80% correct on the post-test items for threshold concepts 2–5; at least 75% complete the transfer task within tolerance; learners can name the four post-fork questions without prompting.
 
-## 15. Delivery Phases and Exit Gates
+## 16. Delivery Phases and Exit Gates
 
 Indicative durations assume one three.js/frontend engineer, one Python/Linux engineer, a part-time learning designer, and a reviewer with kernel and CPython expertise.
 
@@ -789,7 +997,8 @@ Indicative durations assume one three.js/frontend engineer, one Python/Linux eng
 - **S2 Effect size:** confirm that preload on/off, `/scan` versus `/scan-columnar`, and `gc.freeze()` on/off produce large, repeatable differences; choose catalog size and VM memory.
 - **S3 Renderer budget:** nine decks, 250,000 tiles, filament bundles, and fault animations at 60 fps on a reference integrated GPU; flat-mode prototype.
 - **S4 Metaphor test:** a clickable prototype of Modules 3–4 shown to five learners with no narration. Can they explain what a shared frame and a copy-on-write fault are?
-- **Exit gate:** effects are measurable and repeatable; the renderer meets budget; at least four of five learners explain the shared frame correctly.
+- **S5 eBPF startup trace:** a `bpftrace` recording of the reference startup, answering the feasibility questions in Section 13.10.
+- **Exit gate:** effects are measurable and repeatable; the renderer meets budget; at least four of five learners explain the shared frame correctly; a go/no-go decision on including traced startups in the MVP, based on S5.
 
 ### Phase 1 — Model engine and first vertical slice (about 3–4 weeks)
 
@@ -803,7 +1012,8 @@ Indicative durations assume one three.js/frontend engineer, one Python/Linux eng
 - Reference Django project, instrumented Gunicorn configuration, sampler, driver, bundler, and scenarios 2–4 and 9.
 - Replay engine, memory ledger, timeline, replayed terminal, and code pane.
 - Gunicorn and preload model; Modules 5–7.
-- **Exit gate:** recorded and modeled views of the same boot agree within tolerance; Modules 5–7 complete.
+- If S5 passed: the libbpf recorder, offline reconstruction and reconciliation, scenario 13, and Trace replay mode for Modules 6–7.
+- **Exit gate:** recorded and modeled views of the same boot agree within tolerance; Modules 5–7 complete; if traced, reconstruction drift is below threshold at every checkpoint of scenario 13.
 
 ### Phase 3 — Runtime and measurement (about 3 weeks)
 
@@ -818,28 +1028,32 @@ Indicative durations assume one three.js/frontend engineer, one Python/Linux eng
 - Concept map builder, concept inventory, Module 0, and the closing postmortem.
 - Accessibility pass, performance tuning, content review by the expert reviewer.
 - Pilot with eight to twelve engineers; revise based on concept-inventory gains and think-aloud findings.
-- **Exit gate:** pilot targets in Section 14.5 met, or a documented plan to address gaps.
+- **Exit gate:** pilot targets in Section 15.5 met, or a documented plan to address gaps.
 
 ### Phase 5 — Extensions
 
-Live lab mode first (it reuses the sampler and world-state contract), then the deferred drills, Celery prefork, and the transfer gallery, one track at a time.
+Live lab mode first (it reuses the sampler and world-state contract), then recording your own application with the eBPF recorder, the deferred drills, Celery prefork, and the transfer gallery, one track at a time.
 
-## 16. Risks and Mitigations
+## 17. Risks and Mitigations
 
 | Risk | Mitigation |
 | --- | --- |
 | Visual spectacle overwhelms the concept | At most three new elements per step; still-frame readability rule; a "quiet" view with effects off |
 | The model teaches a cartoon | Fidelity contract and badges; calibration tests against recorded runs; expert review; explicit "model" labels at Z3 |
 | Per-page capture needs privileges that are hard to obtain | Unprivileged present/exclusive state as the default; privileged runs only on the reference VM for exact filaments |
-| Kernel, CPython, Django, or Gunicorn behavior changes between versions | Every bundle records versions; a re-verification checklist (Section 18); a scripted recapture pipeline |
+| Kernel, CPython, Django, or Gunicorn behavior changes between versions | Every bundle records versions; a re-verification checklist (Section 19); a scripted recapture pipeline |
 | Effects are too small or noisy on real hardware | Phase 0 effect-size spike; dataset tuning; lessons claim only effects larger than measured variance |
 | Low-end devices cannot render the scene | Level of detail, adaptive quality, and full flat-mode parity |
 | Tiles representing many pages mislead about scale | Persistent scale legend; Z2 shows one tile per page for the selection |
 | Learners over-generalize ("preload is always good", "`gc.freeze()` fixes everything") | Counterexamples in Modules 7–8; every lever has a stated cost; drills include a case where the obvious lever is wrong |
 | Scope creep into a general operating-systems course | MVP limited to the four post-fork questions in a Gunicorn context; extensions are separate tracks |
 | Lab-only endpoints are copied into real projects | Endpoints gated behind a lab setting, clearly named, and absent from any production template |
+| eBPF hooks differ or disappear across kernels | Prefer stable tracepoints and BTF-typed `fentry` on `handle_mm_fault`; detect internal hooks at load time and fall back; record attached hooks in every bundle |
+| Tracing perturbs the startup it records | Measure inflation in S5; bounded windows; adaptive detail; pauses recorded and compensated on the timeline |
+| Event-sourced page state silently drifts from reality | Checkpoint reconciliation in which snapshots always win; visible correction markers; unknown pages drawn as unknown |
+| Recordings of real services leak sensitive data | No memory contents; redaction by default; hashed kernel addresses; opt-in stacks; local-only analysis in the browser |
 
-## 17. Decisions to Close
+## 18. Decisions to Close
 
 1. React-Three-Fiber with imperative hot paths (recommended, consistent with the Live Linux Lab plan) or vanilla three.js.
 2. Whether unprivileged present/exclusive page state is sufficient for every MVP lesson, or whether exact filaments from privileged captures are required in Modules 6–8.
@@ -849,8 +1063,12 @@ Live lab mode first (it reuses the sampler and world-state contract), then the d
 6. Placement of `gc.freeze()` in the recommended configuration (end of preloaded `wsgi.py` versus `pre_fork`), decided from measurements.
 7. Whether the concept map builder ships in the MVP in full or as a lighter "connect the key edges" exercise.
 8. Self-assessed rubrics only (recommended for the MVP) versus optional AI-assisted feedback on explanations.
+9. Whether traced startups enter the MVP, decided at the Phase 0 gate from spike S5.
+10. Recorder implementation: libbpf CO-RE with a Go or Rust loader (recommended) versus staying on `bpftrace` for recordings.
+11. Whether the fork barrier, the cgroup freezer, or both are used for checkpoints, given their effect on timing.
+12. Whether the capture image ships a custom CPython built with DTrace markers and frame pointers, and whether that interpreter is also used for the non-traced scenarios so all recordings share one runtime.
 
-## 18. Facts to Re-verify Against Current Versions
+## 19. Facts to Re-verify Against Current Versions
 
 These claims are central to the lessons and must be checked against the exact versions captured, with results recorded in the bundle manifests and lesson notes:
 
@@ -860,8 +1078,16 @@ These claims are central to the lessons and must be checked against the exact ve
 - **Gunicorn:** setting names and defaults (`preload_app`, `max_requests`, `max_requests_jitter`, `timeout`, `worker_tmp_dir`); server-hook names and signatures; signal handling (`HUP`, `USR2`, `TTIN`, `TTOU`); exact log lines for timeouts and signal-killed workers.
 - **Libraries:** fork-safety guidance for psycopg, redis-py, the OpenTelemetry SDK, and `prometheus_client` multiprocess mode.
 - **Kubernetes:** whether the target versions kill the whole container on OOM under cgroup v2 and how that is configured; the definition of the working-set metric.
+- **eBPF and tracing:**
+  - tracepoint names and fields (`sched_process_fork`, `task_newtask`, `exceptions:page_fault_*`, `signal_*`, `oom:mark_victim`) on the reference kernel;
+  - the `handle_mm_fault` signature and fault flags;
+  - whether the internal copy-on-write functions can be probed or are inlined;
+  - `bpf_send_signal` behavior when called from the child's `clone` exit;
+  - capabilities required for each hook;
+  - that `bpf_ktime_get_ns()` and `time.monotonic_ns()` share a clock in the capture environment.
+- **CPython tracing support:** USDT marker names and arguments in a `--with-dtrace` build; `-X perf` perf-map behavior in forked children.
 
-## 19. Definition of Done for the MVP
+## 20. Definition of Done for the MVP
 
 The MVP is complete when:
 
@@ -869,18 +1095,19 @@ The MVP is complete when:
 - Modules 0–10 and Drills D1–D3 are complete in both 3D and flat modes;
 - every visual element has a metaphor, mechanism, and measurement entry in the inspector;
 - every view carries an accurate model, recorded, or inferred badge;
-- the twelve canonical scenarios are captured on the reference host with manifests, assertions, and replayed terminal output;
+- canonical scenarios 1–12 are captured on the reference host with manifests, assertions, and replayed terminal output;
 - the model engine passes its invariants and stays within calibration tolerance of every canonical scenario;
 - the concept inventory, transfer task, and concept map run end to end, and progress can be exported;
 - accessibility checks pass and a manual screen-reader pass is complete;
-- the facts in Section 18 are verified for the captured versions; and
+- the facts in Section 19 are verified for the captured versions;
+- if traced startups were included, scenario 13 replays step by step with zero unexplained gaps and reconciliation drift below threshold; and
 - a pilot cohort has completed the course and its results are documented.
 
-## 20. Immediate Next Actions
+## 21. Immediate Next Actions
 
-1. Stand up the reference VM and run the Phase 0 capture and effect-size spikes with a throwaway Django project.
+1. Stand up the reference VM and run the Phase 0 capture and effect-size spikes with a throwaway Django project, including the `bpftrace` startup trace for spike S5.
 2. Build the renderer budget spike with synthetic page data at Z2 scale.
 3. Draft Modules 3–4 as a clickable prototype and run the metaphor test with five learners.
 4. Write the world-state and event schema shared by the model engine, replay engine, and renderers.
 5. Draft the concept inventory and the misconception-to-moment mapping before writing lesson narration.
-6. Schedule an expert review of Sections 3, 5, and 18 before Phase 1 content work begins.
+6. Schedule an expert review of Sections 3, 5, and 19 before Phase 1 content work begins.
