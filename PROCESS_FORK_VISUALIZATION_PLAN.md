@@ -19,7 +19,7 @@ The core promise is:
 
 The scene must be visually striking, but the spectacle serves a conceptual model: each visual element maps to a real kernel or runtime structure, is labeled as either **modeled** or **measured**, and has a "ladder" down to the command an engineer would run to see it on a real machine.
 
-A further option, explored in Section 13, is to record a real Gunicorn startup as an ordered log of kernel events with eBPF and let the learner step through it one `fork()`, import, and page fault at a time.
+A further option, explored in Section 13, is to record a real Gunicorn startup as an ordered log of kernel events with eBPF and let the learner step through it one `fork()`, import, and page fault at a time. Section 14 builds on those recordings with a **4D flame graph**: a flame graph for every process, standing in its own lane in 3D, that the learner scrolls backward and forward through time, with annotations marking forks, imports, collections, and findings.
 
 ## 2. Why This Matters to an Engineer Supporting Production
 
@@ -279,11 +279,13 @@ The visuals can be accurate while the narration teaches a misconception. Authors
 - A first-class 2D "flat mode" that renders the same world state without WebGL, for accessibility and low-power devices.
 - Progress stored locally in the browser, with export and import.
 - *Conditional on spike S5:* eBPF-traced startup recordings of the reference application and a Trace replay mode for stepping through them (Section 13).
+- Model-mode stack towers showing the call stack being copied at `fork()` (Section 14.12); *conditional on spikes S5 and S6:* the recorded 4D flame graph with CPU and copy-on-write metrics (Section 14).
 
 ### 6.2 Deferred extension tracks
 
 - **Live lab mode:** connect the browser to a learner-run Docker Compose stack and visualize a live Gunicorn deployment.
 - **Record your own application:** a packaged eBPF recorder that captures a service's startup in staging and opens it locally in Forkscape with a fork health report (Section 13.9).
+- **Flame graph extensions:** off-CPU lanes, differential coloring between recordings, the canyon layout, and importing continuous-profiler data (Section 14.12).
 - **Threads and locks drill:** a background thread started at import time deadlocks or silently disappears in workers.
 - **Deploy and reload drill:** `HUP` versus `USR2` versus a full restart, with and without preload.
 - **Timeouts and respawn drill:** heartbeat files, `worker_tmp_dir`, and boot cost under load.
@@ -327,7 +329,7 @@ The MVP is roughly two to three hours of material in 10–20 minute modules. Eac
 ### Module 2: `fork()` — one call, two returns
 
 - **Objective:** understand return values, parent/child identity, and reaping.
-- **Scene:** a code pane with `pid = os.fork()`; the deck duplicates and both decks continue from the same line. The child shows `pid == 0`; the parent shows the child's PID.
+- **Scene:** a code pane with `pid = os.fork()`; the deck duplicates and both decks continue from the same line. The child shows `pid == 0`; the parent shows the child's PID. A stack tower beside each deck shows the call stack being copied too: both processes return from the same `os.fork()` frame (Section 14).
 - **Prediction:** "How many times does the `print()` after `fork()` run?"
 - **Interaction:** step through the code; let the child exit without being waited for and see it linger as a zombie until the parent reaps it.
 - **On call:** the Gunicorn master reaps its workers; a supervisor that never reaps leaves zombies.
@@ -360,7 +362,7 @@ The MVP is roughly two to three hours of material in 10–20 minute modules. Eac
 ### Module 6: Gunicorn's arbiter and its workers
 
 - **Objective:** the pre-fork lifecycle.
-- **Scene:** the arbiter deck at the center, workers in a ring, and the listening-socket well below. Requests arrive as particles, queue in the well, and are pulled in by whichever worker calls `accept()`. Workers emit heartbeat pulses; each has a timeout ring that fills when heartbeats stop.
+- **Scene:** the arbiter deck at the center, workers in a ring, and the listening-socket well below. Requests arrive as particles, queue in the well, and are pulled in by whichever worker calls `accept()`. Workers emit heartbeat pulses; each has a timeout ring that fills when heartbeats stop. In the code layer, each worker's stack tower starts with the arbiter's own `spawn_worker` frames, so a worker visibly begins life inside the master's code.
 - **Prediction:** "A worker is killed with `SIGKILL`. What happens to total memory a minute later?"
 - **Interactions:** boot the server and watch bind → fork × N → accept; send `TTIN` and `TTOU` to add and remove workers; kill a worker and watch the arbiter reap and replace it; call a slow endpoint until a worker misses its heartbeat and is aborted; set a low `max_requests` with jitter and watch staggered recycling.
 - **On call:** recognize the Gunicorn log lines for booting, timeouts, and signal-killed workers; know that the arbiter respawns from its own template.
@@ -465,13 +467,15 @@ Workload controls set the request mix (`/lookup`, `/scan`, `/scan-columnar`, `/c
 
 All panels subscribe to a single selection and time cursor. Selecting a worker deck filters the ledger, highlights that worker's events on the timeline, and switches the replayed terminal to commands for that PID. Scrubbing the timeline moves every view.
 
+When stack data is available, the **code layer** (the 4D flame graph, Section 14) joins the same selection and cursor. Hovering a flame frame highlights the pages it un-shared on the deck and their copies on the floor. Selecting a page shows the frames responsible for un-sharing it, where a stack was sampled.
+
 ### 8.5 Prediction and assessment UX
 
 - Predictions are made with sliders, card sorts, multiple choice, or a hand-drawn curve on a small chart. The submit button is the only way forward; there is no "skip to answer" in guided mode, but there is a "I don't know yet" option that counts as a prediction.
 - Results overlay the prediction on the outcome rather than replacing it.
 - Self-explanations are compared with a model answer and a three-to-five item rubric checklist that the learner ticks honestly.
 - Learners optionally rate confidence; the summary highlights confident-but-wrong predictions as the most valuable review targets.
-- The concept inventory (Section 15.5) runs before Module 1 and after Module 10.
+- The concept inventory (Section 16.5) runs before Module 1 and after Module 10.
 
 ## 9. Visual Design North Star: Glass Decks over a Memory Floor
 
@@ -544,9 +548,10 @@ At Z0–Z1 a tile may represent many pages; the legend always states the current
 | **Model engine** | Exact page-table, frame, and copy-on-write semantics for a small simplified system; a simplified CPython heap; the arbiter state machine | Real sizes, real timings, exact CPython object layout | Modules 1–5, Z3 page interior, sandbox |
 | **Recorded run** | Real per-process memory figures, per-page shared/exclusive state at keyframes, minor-fault counts, Gunicorn events, request outcomes, replayed command output | Behavior on other kernels, Python versions, or hardware; causality not supported by the evidence | Modules 0 and 6–10, drills, calibration |
 | **Event trace** (eBPF, Section 13) | Exact order and timing of observed kernel and runtime events; fault addresses and flags; socket and thread evidence; per-page state reconstructed from events and reconciled against snapshots | Complete state between checkpoints across a gap; frame identity unless captured; Python attribution without a sampled stack | Trace replay, Modules 6–8, Drill D2 |
+| **Sampled stacks** (Section 14) | Statistical share of CPU time or faults by code path within a window; exact stacks at rare tagged events | Exact durations or counts from sampled data; ordering within a window (flame graph widths are not time) | 4D flame graph, Modules 6–8, Drills D1–D2 |
 | **Live lab** (post-MVP) | The learner's own deployment in real time | More precision than its sampling rate | Extension track |
 
-The model engine is calibrated against recorded runs: its parameters (shared pages after boot, pages dirtied per request type, the fraction of heap pages touched by a full collection) are fitted to captures, and CI checks that the model stays within tolerance of the recorded results (Section 15.2).
+The model engine is calibrated against recorded runs: its parameters (shared pages after boot, pages dirtied per request type, the fraction of heap pages touched by a full collection) are fitted to captures, and CI checks that the model stays within tolerance of the recorded results (Section 16.2).
 
 ## 11. Technical Architecture
 
@@ -577,6 +582,7 @@ The renderers never know whether data came from the model or a recording. Both e
 
 - **World state:** processes (PID, parent PID, role, start time, thread count), regions (name, kind, page range, anonymous or file-backed), per-page state arrays, frames (model engine and privileged captures only), descriptors and the kernel objects they reference, memory figures per process, and container-level figures.
 - **Per-page state** is a compact typed array per process and region: not present, present and exclusive, present and shared, file-backed shared; plus an optional sharer count when known.
+- **Stacks and samples** (when available): an interned frame table, a stack trie, and columnar samples by time, process, stack, metric, and weight (Section 14.7).
 - **Events:** `fork`, `exit`, `reap`, `signal`, `cow_fault` (model) or `minor_fault_delta` (recorded), `page_state_snapshot`, `request_start`, `request_end`, `gc_collect`, `gc_freeze`, `heartbeat`, `timeout_abort`, `worker_recycle`, `oom_kill`, and `config_change`. Each event carries `source: "model" | "recorded" | "inferred"`.
 
 ### 11.3 Model engine
@@ -595,6 +601,7 @@ Pure TypeScript with no rendering dependencies, deterministic for a given seed, 
 - **Stack:** TypeScript, Vite, three.js composed with React-Three-Fiber and drei, matching the Live Linux Lab visualization plan. Hot paths (instance attribute updates, filament buffers) are imperative three.js code fed directly by the world store, outside React's render cycle. Pin an exact three.js release and upgrade deliberately.
 - **Tiles:** `InstancedMesh` for deck tiles and floor frames, with per-instance attributes (state, owner hue index, sharer count, highlight). A custom shader draws hatching, frost, and pulses from a time uniform, so steady-state animation needs no per-frame CPU work. Only changed instance ranges are uploaded.
 - **Filaments:** individual line segments only for the current selection and for transient fault animations; bundled ribbons with width proportional to page count elsewhere. Curves are rebuilt only when layout changes.
+- **Flame blocks:** one `InstancedMesh` of extruded boxes for all flame lanes, laid out by a Web Worker and tweened in the shader (Section 14.9).
 - **Interaction:** instance-level picking via raycasting; preset camera shots per lesson step with smooth transitions; free orbit in sandbox and replay modes.
 - **Effects:** selective bloom for fault sparks and the OOM strike, disabled in reduced-motion and low-power modes.
 - **Adaptive quality:** monitor frame time and reduce instance counts, filament detail, and effects before dropping frames; show a "simplified view" indicator when this happens.
@@ -772,7 +779,7 @@ A traced, preloaded startup of the reference application would be expected to re
 | Descriptors and sockets | System-call tracepoints for `socket`, `bind`, `listen`, `accept4`, `connect`, `close`, `dup*`; `kprobe`s on TCP send and receive paths keyed by the kernel socket object | Which processes use which kernel socket — directly detects two workers using one database connection | Kernel object addresses must be replaced with per-recording hashed identifiers before leaving the recorder |
 | Memory pressure and OOM | `oom:mark_victim`; cgroup `memory.events` | Victim process and timing | Stable |
 | CPython runtime | USDT markers: `import__find__load__start`/`done`, `gc__start`/`done` | Module names for imports; garbage-collection generations and timing | Requires CPython built with `--with-dtrace`; per-function markers are too costly and are not used |
-| Python stacks | User-stack capture with frame pointers plus perf maps from `python -X perf` (3.12+), or an interpreter-aware eBPF unwinder | Which Python code was running when a sampled fault occurred | Sample rather than capture per event; the perf map must be valid in forked workers |
+| Python stacks | User-stack capture with frame pointers plus perf maps from `python -X perf` (3.12+), or an interpreter-aware eBPF unwinder | Which Python code was running at timer samples, sampled faults, and every rare tagged event (`fork`, thread creation, `connect`); feeds the 4D flame graph (Section 14) | Sample rather than capture every fault; the perf map must be valid in forked workers |
 | Gunicorn semantics | Existing server hooks over a Unix datagram socket (Section 11.6) | `pre_fork`, `post_fork`, `worker_abort`, `child_exit`, and others | User space, timestamped with the same monotonic clock as eBPF |
 | Ground truth | `/proc/<pid>/maps`, `smaps_rollup`, and `pagemap` at checkpoints (not eBPF) | Authoritative per-page state | See Sections 13.3 and 13.4 |
 
@@ -885,6 +892,7 @@ A preloaded master whose heap grows by a few hundred MiB first-touches tens of t
 - **Module 8.** First-request copy-on-write faults are shown with sampled Python stacks, making "reading is writing" concrete in real code.
 - **Drill D2.** The trace shows `connect` in the master before the fork and two worker processes sending on the same kernel socket afterward, which is the strongest possible evidence for that incident.
 - **Learner experience.** A **Trace replay** mode is added to Section 8.2.
+- **Code view.** The same recordings drive the 4D flame graph (Section 14), which shows the same timeline from the code's point of view.
 
 ### 13.9 Recording your own application (post-MVP)
 
@@ -927,9 +935,151 @@ The same recorder could let engineers record **their own service's startup**, fo
 
 **Recommendation:** treat an eBPF-traced startup as the "gold" recording of the reference application's boot. Run spike S5 in Phase 0. If it passes, include traced startups with and without preload (scenario 13) in Modules 6–7 and Drill D2 as part of the MVP, and ship Trace replay mode. Keep the `/proc` sampler as the portable baseline and as the ground truth for reconciliation. Defer recording your own application to post-MVP.
 
-## 14. Accessibility and Performance
+## 14. The 4D Flame Graph View
 
-### 14.1 Accessibility
+A flame graph shows which code paths account for a cost. Its width is the share of samples, its height is stack depth, and frames are sorted by name rather than by time. A flame chart instead puts time on the horizontal axis. Both are 2D, and both struggle to show **several processes whose stacks are related by `fork()`** or **how the picture changes across a startup**.
+
+The 4D flame graph adds those two missing dimensions. Each process gets its own flame graph, standing in its own lane in 3D space. The learner scrolls backward and forward through time while the flames morph, and on-screen annotations mark the relevant events: forks, imports, collections, signals, hooks, and automatic findings.
+
+It is not a separate tool. It is another layer of the same world: the flames rise from the same glass decks, above the same memory floor, driven by the same timeline.
+
+### 14.1 Dimensions and encodings
+
+| Dimension | Encodes | Notes |
+| --- | --- | --- |
+| **x** (width) | Share of the selected metric within the current time window | Classic flame-graph meaning: frames sorted by name, so position is stable while widths change |
+| **y** (height) | Stack depth | Gunicorn and Python frames at the base; native frames above; kernel frames (for example, a copy-on-write page copy) on top when included |
+| **z** (depth) | Process lane | Master in front, workers behind in fork order; a new lane is printed from the master's lane at each fork |
+| **t** (scroll) | Position of the time window | Scrolled, stepped, or played forward and backward; the fourth dimension |
+
+The remaining channels are kept deliberately simple:
+
+- **Color** encodes code origin: application, Django, Gunicorn, other third-party, standard library, interpreter/native, and kernel. The palette is safe for color-vision deficiencies and backed by patterns; kernel frames are hatched.
+- **Outline and glow** mark selection, annotation anchors, and frames heavy in the current metric.
+- Nothing else is encoded in hue or brightness, so the view stays readable.
+
+### 14.2 Why this view earns its place
+
+- **The stack forks too.** At `fork()` the child's call stack is a copy of the parent's: both return from the same `os.fork()` call inside Gunicorn's `spawn_worker`. In the view, the master's lane is copied into a new worker lane, and the child's flames then diverge into worker initialization and the accept loop. A worker's stack permanently begins with the master's own frames — a surprising, verifiable fact that makes "the child continues from the same line" concrete.
+- **Who pays for imports.** With preload off, every worker lane shows the same tall import flame after the fork. With preload on, the import flame appears once, in the master, before any worker lanes exist. Both CPU time and private memory follow the same pattern.
+- **Reading is writing, in code terms.** When the metric switches from CPU samples to pages un-shared by copy-on-write, a `/scan` loop that is a sliver of CPU becomes a wide block. Collector frames appear as the source of un-sharing, and the kernel's page-copy frames sit visibly on top of the Python frames that caused them.
+- **The culprit's call site.** Stacks captured at rare events name the exact code that opened a database connection or started a thread in the master before the fork (Drills D2 and the threads drill).
+- **Transfer to production profilers.** Engineers already read flame graphs from Parca, Pyroscope, py-spy, and commercial profilers. This view teaches the same reading skills plus a time-aware habit: an average over a long window hides startup bursts and periodic collections, so look at how the graph changes over time.
+
+### 14.3 Layouts and camera
+
+- **Lanes (default).** Decks line up as parallel rows on a stage, flames rise from each deck, and the memory floor stays below. Lanes are comparable because they face the same way.
+- **In-scene ring.** Flames stand on the decks in their normal ring around the arbiter, which preserves the spatial story of Section 9 at the cost of easy comparison.
+- **Canyon (one process).** For a single lane, successive time windows are laid out front to back so the lane's history becomes a landscape: long phases form ridges, and a glowing plane marks the current time. Here time is spatial and z no longer means "process".
+- **Orthographic by default.** Perspective foreshortening distorts widths, which are the quantity being read. The flame view uses an orthographic camera; perspective is available for overview shots, and a "flatten" control snaps any lane to a front-on 2D reading.
+- **Layer presets.** *Code* shows flames and decks with the floor dimmed. *Memory* shows decks, filaments, and floor with flames hidden. *Both* is used for linking moments.
+
+### 14.4 Scrolling through time
+
+- **Window.** The flame graph at the cursor aggregates the window ending at the cursor. Its default length depends on the metric (longer for CPU samples, which are sparse; shorter for fault events, which are dense), and the learner can adjust it. The current sample count is always displayed.
+- **Stack towers at fine scale.** When the window is shorter than one sampling interval, each lane shows the single most recent stack as a column. Stepping sample by sample then shows the stack breathing call by call, which connects the flame view to the step-through replay of Section 13.7.
+- **Stable morphing.** Frames keep their sorted position; widths animate between windows; new frames grow from zero width at their sorted place; vanished frames shrink and fade. Frames below a minimum width merge into a per-parent "other" block. Tweening is skipped while the learner drags quickly, so the view never lags the cursor.
+- **Timeline and heatmap.** The 2D timeline gains a FlameScope-style heatmap per lane (sample density over time), so bursts and quiet periods can be spotted and brushed to set the window.
+- **Quiet-period compression.** Long stretches with no events and idle workers can be compressed on the timeline, with a visible break marker and real timestamps preserved. Compression can be turned off.
+- **Controls.** Scroll over the timeline or Shift-scroll in the scene to scrub; arrow keys step by window; `[` and `]` jump to the previous and next annotation; play at variable speed, including in reverse; "next fork", "next import", and "next collection" buttons jump between event types. The cursor snaps magnetically to annotated events, with a modifier key to disable snapping.
+
+### 14.5 Annotations
+
+Annotations make the time dimension navigable. Each has a time (or time range), kind, title, detail, anchor, importance, and source badge, and it links to the raw event in the inspector.
+
+- **Kinds:**
+  - *event annotations* generated from the trace (fork, exec, import, collection, signal, Gunicorn hook);
+  - *findings* generated by analysis (Section 13.7), such as "thread alive at fork" or "socket used by two processes";
+  - *lesson annotations* written by course authors;
+  - *learner notes* pinned at a time and frame, stored with the learner's local progress.
+- **Anchors.** An annotation attaches to a frame path in a lane (for example, the `os.fork` frame in the master lane), to a whole lane, or to the global timeline. Labels are HTML overlays with leader lines to their 3D anchors and are laid out in screen space to avoid overlaps.
+- **Temporal behavior.** An annotation fades in shortly before its event and lingers shortly after, so scrubbing does not make it flash. It is emphasized when the cursor is on the event. Annotations passed during a fast scrub collect in a "just passed" ticker so none are missed.
+- **Density.** Importance levels and filter chips (fork, import, collection, signal, hook, finding, lesson, note) limit how many labels are on screen. Thresholds tighten as the window widens.
+
+Illustrative annotations for a traced, preloaded startup:
+
+| Time | Lane | Anchor frame | Annotation |
+| --- | --- | --- | --- |
+| *t₀* | Master | Process base | `exec`: Gunicorn starts |
+| *t₁* | Master | Socket creation → `bind` | Listening socket created; every worker will inherit it |
+| *t₂*–*t₃* | Master | Import machinery | Preload: importing Django and the application (*N* modules, heap +*M* MiB) |
+| *t₄* | Master | `AppConfig.ready` → `connect` | ⚠ Database connection opened before fork (see Drill D2) |
+| *t₅* | Master | `spawn_worker` → `os.fork` | `fork()` → worker PID *p*; the child's stack is a copy of this one |
+| *t₅* | Worker 1 | `spawn_worker` | `fork()` returns 0 here: same frames, new process |
+| *t₆* | Worker 1 | Worker initialization | `post_fork` hook; first copy-on-write faults: *n* pages |
+| *t₇* | Worker 2 | URL resolution → import machinery | Lazy URLconf import after fork: *n* pages private to this worker |
+
+### 14.6 Metrics
+
+| Metric | Weight per sample | Source | Teaches |
+| --- | --- | --- | --- |
+| CPU | One on-CPU stack sample | eBPF timer sampling, or py-spy/Austin as a non-eBPF fallback | Where startup time goes; who pays for imports |
+| Off-CPU (post-MVP) | Time blocked, from scheduler switch events | eBPF on `sched_switch` with stacks | Workers waiting in `accept`; the arbiter sleeping in its loop |
+| First-touch faults | Pages newly allocated by a fault | Fault events with sampled stacks (Section 13) | Which imports and data structures grow the heap |
+| Copy-on-write pages | Pages un-shared by a write fault | Fault events classified by reconstruction, with sampled stacks | Which code breaks sharing: reference counting, collections, lazy caches |
+
+Switching metrics morphs the same lanes in place. Frames that are cheap in CPU but expensive in un-shared pages are flagged during the transition, because that contrast is the lesson of Module 8.
+
+### 14.7 Data requirements
+
+- **CPU stacks.** eBPF timer sampling with user and kernel stacks. Python frame names come from perf maps written by `python -X perf` (with frame pointers) or from an interpreter-aware eBPF unwinder. Startup recordings may use a higher sampling rate than production would tolerate, because the window is short; the overhead is measured in spike S6.
+- **Fault stacks.** On sampled page-fault events the recorder captures the user stack (and optionally the kernel stack) of the faulting thread. Weights are scaled by the sampling rate and labeled as estimates.
+- **Event-tagged stacks.** At rare, high-value events — `fork`, thread creation, `socket`, `connect`, large `mmap` — the recorder captures the stack every time, since these events are cheap to annotate in full.
+- **Fallback without eBPF.** A sampling profiler that reads Python stacks from outside the process (py-spy or Austin, following child processes) can supply CPU lanes for `/proc`-only recordings. Fault metrics are unavailable without eBPF, and the view says so.
+- **Model mode.** The model engine generates canonical stacks for scripted moments — `spawn_worker` → `os.fork` in the master, the child's return, worker initialization, the accept loop — always labeled **MODEL**.
+- **Data model.** An interned frame table (name, file, module, category, kind: Python, native, or kernel); a stack trie (parent, frame); and columnar samples (time, lane, stack, weight, metric, source). Annotations are derived from events and stored alongside.
+- **Bundle additions:** `stacks/frames`, `stacks/trie`, and `samples/<metric>` chunks inside `trace/`.
+- **Imports (post-MVP).** Folded stacks per window, or pprof/OpenTelemetry profiles that carry timestamps, so profiles from continuous profilers can be viewed at their own time resolution.
+
+### 14.8 Reading pitfalls the view must prevent
+
+- **Width is not time.** The legend states what width means for the current metric and window. A one-click toggle turns a single lane into a flame chart (x = time inside the window) for reading sequences.
+- **Sparse samples are noisy.** Short CPU windows contain few samples. The sample count is always shown, frames with low counts are dimmed, and the view warns when the window is too short for the metric.
+- **Collections are attributed to whatever allocated.** A collection runs inside whatever allocation triggered it, so un-sharing caused by the collector appears beneath unrelated application frames. The guide teaches learners to read the collector frame, not its caller, and the view groups collector frames for this metric.
+- **Interpreter frames hide the Python story.** Interpreter-internal native frames are collapsed by default, with a toggle to show them. Reference-count increments are compiled inline, so they never appear as their own frame; the fault is attributed to the Python frame that was running.
+- **Perspective distorts width.** This is handled by the orthographic default and the flatten control (Section 14.3).
+- **Estimated weights.** Sampled fault weights are estimates; exact counts from the trace appear in the inspector for comparison.
+
+### 14.9 Implementation notes
+
+- **Aggregation in a Web Worker.** Samples are sorted by time. For a window, a binary search finds the sample range, weights are added at trie leaves for each lane, and totals are propagated up the trie. A startup-sized recording aggregates in a few milliseconds per scrub step. For very long imported profiles, per-node cumulative counts at time-bucket boundaries make any window an O(nodes) subtraction.
+- **Layout.** Per lane, children are sorted by frame name, and their x offsets and widths come from the aggregated weights. The worker returns typed arrays (offset, width, depth, category, node ID) ready for instancing.
+- **Rendering.** All frame blocks across all lanes are drawn as one `InstancedMesh` of extruded boxes with per-instance attributes. Signed-distance-field text labels are drawn only for blocks wide enough on screen; hovered and annotated frames get HTML labels. Tweens run in the shader from previous and next layout attributes, so CPU work per frame stays small.
+- **Budgets.** Up to roughly 50,000 visible frame blocks across lanes at 60 fps on the reference GPU; aggregation and layout within one frame budget for startup recordings; adaptive coarsening (raising the "other" threshold) before dropping frames.
+
+### 14.10 Accessibility and the flat equivalent
+
+- **Flat mode.** The flat renderer shows a synchronized 2D flame graph for one lane at a time (with a lane switcher), or small multiples, with the same time controls and annotations.
+- **Keyboard navigation of the frame tree.** Up and down move through depth and left and right move between siblings; the screen reader announces the frame name, share, and sample count.
+- **Window summaries.** A text summary describes each window, for example: "1.20–1.30 s: master 92% in import machinery (`django.urls` …); workers 1–4 idle in accept."
+- **Annotations as a list.** The annotation list is an ordered, keyboard-navigable timeline that moves with the cursor and is announced as the learner scrubs.
+
+### 14.11 Spike S6: is the fourth dimension worth it?
+
+3D flame graphs are novel, and novelty is not evidence of readability. Spike S6 tests the view before it becomes a default.
+
+- **Data:** CPU and copy-on-write stacks for the reference startup and the first 100 requests, from the S5 recorder (and from py-spy for the fallback path).
+- **Prototype:** lanes layout, scrubbing, morphing, annotations, and the metric switch.
+- **Usability comparison** against synchronized 2D flame graphs plus the timeline, on tasks such as:
+  - find when the first fork happened and which frame called it;
+  - say which worker imported the URLconf, and when;
+  - find the code responsible for most copy-on-write faults after the first requests;
+  - say what was running in the master when the database connection was opened.
+- **Measures:** accuracy, time on task, and learner preference. Also measured: stack-sampling overhead and whether Python frames are named correctly in forked workers.
+- **Decision:** if the 4D view is at least as accurate as the 2D baseline and helps with the fork-related tasks, it becomes the default code view. Otherwise the synchronized 2D flame graphs become the default, and the 4D view is kept as an overview and for the "stack forks too" moments.
+
+### 14.12 Scope recommendation
+
+- **MVP, no extra dependencies:** model-mode stack towers in Modules 2 and 6 showing the stack being copied at `fork()` and the child returning 0 inside `spawn_worker`.
+- **MVP, conditional on S5 and S6:**
+  - the recorded 4D flame graph with CPU and copy-on-write metrics in Trace replay;
+  - Modules 6–8;
+  - Drills D1 and D2.
+- **Post-MVP:** the off-CPU metric; differential coloring between two aligned recordings; the canyon layout; importing continuous-profiler data; flame lanes for recordings of the learner's own application.
+
+## 15. Accessibility and Performance
+
+### 15.1 Accessibility
 
 - Flat mode parity: every lesson, prediction, and drill is completable without WebGL.
 - Keyboard navigation for selection, camera presets, time controls, and all panels; visible focus.
@@ -938,16 +1088,17 @@ The same recorder could let engineers record **their own service's startup**, fo
 - Color is never the only channel (Section 9.4); contrast meets WCAG AA in all themes.
 - Captions for any optional audio; sound off by default.
 
-### 14.2 Performance budgets
+### 15.2 Performance budgets
 
 - First meaningful scene (Module 1) interactive in under five seconds on a mid-range laptop with a cold cache.
 - 60 fps target on a reference integrated GPU at Z0–Z2 with up to roughly 250,000 visible tiles; adaptive quality before dropping below 30 fps.
 - Draw calls under 100 in typical shots.
 - Initial JavaScript under a stated budget; three.js, the engine, and bundles loaded per route.
+- 4D flame graph: up to roughly 50,000 visible frame blocks at 60 fps, with window aggregation and layout within one frame budget for startup recordings (Section 14.9).
 
-## 15. Testing and Validation
+## 16. Testing and Validation
 
-### 15.1 Engine tests
+### 16.1 Engine tests
 
 - Unit tests for every kernel, descriptor, thread, CPython, and arbiter operation.
 - Property-based tests for invariants:
@@ -958,24 +1109,25 @@ The same recorder could let engineers record **their own service's startup**, fo
   - descriptor reference counts match the processes holding them;
   - the same seed always produces the same event stream.
 
-### 15.2 Calibration tests
+### 16.2 Calibration tests
 
 For each canonical recorded scenario, run the calibrated model and assert that key outcomes (shared fraction at boot, private growth per request type, decay saturation level, ΣPSS against cgroup memory) fall within a tolerance band derived from capture variance. CI fails when a model change drifts outside the band.
 
-### 15.3 Bundle and replay tests
+### 16.3 Bundle and replay tests
 
 - Schema validation for every bundle.
 - Replay determinism: replaying a bundle produces the same sequence of world-state hashes.
+- Flame aggregation: for any window, lane widths sum to the window's total weight; no child is wider than its parent; sibling order is stable across windows; and a folded-stack export of the window matches a reference collapse of the same samples.
 - Capture reproducibility: canonical scenarios are re-run several times on the reference host; lessons only claim effects larger than the observed variance.
 
-### 15.4 Interface tests
+### 16.4 Interface tests
 
 - Playwright end-to-end tests that complete every module in both 3D and flat modes.
 - Screenshot tests for key camera shots in all themes and in reduced-motion mode.
 - Automated accessibility checks on the 2D interface, plus a manual screen-reader pass per release.
 - Renderer budget checks using renderer statistics (instance counts, draw calls) in CI, and manual frame-time checks on reference devices.
 
-### 15.5 Learning validation
+### 16.5 Learning validation
 
 - **Concept inventory:** 12–15 items targeting the misconceptions in Section 5.5, used before and after. Example items:
   - "Immediately after a 300 MiB process forks, roughly how much additional physical memory is in use?"
@@ -987,24 +1139,26 @@ For each canonical recorded scenario, run the calibrated model and assert that k
 - **Transfer task:** from unseen `smaps_rollup` output for one master and four workers, estimate total memory within 15% and recommend a worker count for a stated limit.
 - **Targets for the pilot:** at least 80% correct on the post-test items for threshold concepts 2–5; at least 75% complete the transfer task within tolerance; learners can name the four post-fork questions without prompting.
 
-## 16. Delivery Phases and Exit Gates
+## 17. Delivery Phases and Exit Gates
 
 Indicative durations assume one three.js/frontend engineer, one Python/Linux engineer, a part-time learning designer, and a reviewer with kernel and CPython expertise.
 
-### Phase 0 — Discovery spikes (about 2 weeks)
+### Phase 0 — Discovery spikes (about 2–3 weeks)
 
 - **S1 Capture feasibility:** on the reference VM, confirm `smaps_rollup`, per-page present/exclusive state from `pagemap` without full privilege, privileged frame numbers and `kpagecount`, soft-dirty tracking, and sampler overhead.
 - **S2 Effect size:** confirm that preload on/off, `/scan` versus `/scan-columnar`, and `gc.freeze()` on/off produce large, repeatable differences; choose catalog size and VM memory.
 - **S3 Renderer budget:** nine decks, 250,000 tiles, filament bundles, and fault animations at 60 fps on a reference integrated GPU; flat-mode prototype.
 - **S4 Metaphor test:** a clickable prototype of Modules 3–4 shown to five learners with no narration. Can they explain what a shared frame and a copy-on-write fault are?
 - **S5 eBPF startup trace:** a `bpftrace` recording of the reference startup, answering the feasibility questions in Section 13.10.
-- **Exit gate:** effects are measurable and repeatable; the renderer meets budget; at least four of five learners explain the shared frame correctly; a go/no-go decision on including traced startups in the MVP, based on S5.
+- **S6 4D flame graph:** a prototype on S5 stack data, plus a usability comparison with synchronized 2D flame graphs (Section 14.11).
+- **Exit gate:** effects are measurable and repeatable; the renderer meets budget; at least four of five learners explain the shared frame correctly; go/no-go decisions on including traced startups (S5) and the recorded 4D flame graph (S6) in the MVP, and on which code view is the default.
 
 ### Phase 1 — Model engine and first vertical slice (about 3–4 weeks)
 
 - Kernel, descriptor, and thread model with property tests.
 - Renderer for decks, membrane, floor, filaments, and Z0–Z2.
 - Lesson runner, prediction UX, and Modules 1–4 in model mode, plus flat mode for those modules.
+- Model-mode stack towers for Module 2.
 - **Exit gate:** Modules 1–4 complete end to end in both modes; invariants pass; a pilot learner completes them unaided.
 
 ### Phase 2 — Capture pipeline and replay (about 3–4 weeks)
@@ -1013,11 +1167,13 @@ Indicative durations assume one three.js/frontend engineer, one Python/Linux eng
 - Replay engine, memory ledger, timeline, replayed terminal, and code pane.
 - Gunicorn and preload model; Modules 5–7.
 - If S5 passed: the libbpf recorder, offline reconstruction and reconciliation, scenario 13, and Trace replay mode for Modules 6–7.
+- If S6 passed: the 4D flame graph with CPU lanes and annotations for Modules 6–7.
 - **Exit gate:** recorded and modeled views of the same boot agree within tolerance; Modules 5–7 complete; if traced, reconstruction drift is below threshold at every checkpoint of scenario 13.
 
 ### Phase 3 — Runtime and measurement (about 3 weeks)
 
 - CPython heap model and Z3 page interior.
+- If S6 passed: first-touch and copy-on-write metrics in the 4D flame graph, linked to deck pages and floor frames.
 - Scenarios 5–8; model calibration and calibration tests.
 - Modules 8–9, the sizing calculator, and the sandbox.
 - **Exit gate:** decay curves from the calibrated model match recorded runs within tolerance; the transfer task is answerable from the ledger alone.
@@ -1028,20 +1184,20 @@ Indicative durations assume one three.js/frontend engineer, one Python/Linux eng
 - Concept map builder, concept inventory, Module 0, and the closing postmortem.
 - Accessibility pass, performance tuning, content review by the expert reviewer.
 - Pilot with eight to twelve engineers; revise based on concept-inventory gains and think-aloud findings.
-- **Exit gate:** pilot targets in Section 15.5 met, or a documented plan to address gaps.
+- **Exit gate:** pilot targets in Section 16.5 met, or a documented plan to address gaps.
 
 ### Phase 5 — Extensions
 
 Live lab mode first (it reuses the sampler and world-state contract), then recording your own application with the eBPF recorder, the deferred drills, Celery prefork, and the transfer gallery, one track at a time.
 
-## 17. Risks and Mitigations
+## 18. Risks and Mitigations
 
 | Risk | Mitigation |
 | --- | --- |
 | Visual spectacle overwhelms the concept | At most three new elements per step; still-frame readability rule; a "quiet" view with effects off |
 | The model teaches a cartoon | Fidelity contract and badges; calibration tests against recorded runs; expert review; explicit "model" labels at Z3 |
 | Per-page capture needs privileges that are hard to obtain | Unprivileged present/exclusive state as the default; privileged runs only on the reference VM for exact filaments |
-| Kernel, CPython, Django, or Gunicorn behavior changes between versions | Every bundle records versions; a re-verification checklist (Section 19); a scripted recapture pipeline |
+| Kernel, CPython, Django, or Gunicorn behavior changes between versions | Every bundle records versions; a re-verification checklist (Section 20); a scripted recapture pipeline |
 | Effects are too small or noisy on real hardware | Phase 0 effect-size spike; dataset tuning; lessons claim only effects larger than measured variance |
 | Low-end devices cannot render the scene | Level of detail, adaptive quality, and full flat-mode parity |
 | Tiles representing many pages mislead about scale | Persistent scale legend; Z2 shows one tile per page for the selection |
@@ -1052,8 +1208,10 @@ Live lab mode first (it reuses the sampler and world-state contract), then recor
 | Tracing perturbs the startup it records | Measure inflation in S5; bounded windows; adaptive detail; pauses recorded and compensated on the timeline |
 | Event-sourced page state silently drifts from reality | Checkpoint reconciliation in which snapshots always win; visible correction markers; unknown pages drawn as unknown |
 | Recordings of real services leak sensitive data | No memory contents; redaction by default; hashed kernel addresses; opt-in stacks; local-only analysis in the browser |
+| The 4D flame graph is harder to read than a 2D one | Spike S6 usability comparison decides the default; orthographic camera and flatten control; synchronized 2D flame graphs always available |
+| Learners misread flame graphs (width as time, garbage-collection attribution, noisy short windows) | Explicit legends, flame-chart toggle, sample counts and dimming, grouped collector frames, and a reading guide (Section 14.8) |
 
-## 18. Decisions to Close
+## 19. Decisions to Close
 
 1. React-Three-Fiber with imperative hot paths (recommended, consistent with the Live Linux Lab plan) or vanilla three.js.
 2. Whether unprivileged present/exclusive page state is sufficient for every MVP lesson, or whether exact filaments from privileged captures are required in Modules 6–8.
@@ -1067,8 +1225,10 @@ Live lab mode first (it reuses the sampler and world-state contract), then recor
 10. Recorder implementation: libbpf CO-RE with a Go or Rust loader (recommended) versus staying on `bpftrace` for recordings.
 11. Whether the fork barrier, the cgroup freezer, or both are used for checkpoints, given their effect on timing.
 12. Whether the capture image ships a custom CPython built with DTrace markers and frame pointers, and whether that interpreter is also used for the non-traced scenarios so all recordings share one runtime.
+13. Whether the 4D flame graph or synchronized 2D flame graphs are the default code view, decided from spike S6.
+14. Default time windows per metric, the code-origin color categories, and whether interpreter frames are hidden by default.
 
-## 19. Facts to Re-verify Against Current Versions
+## 20. Facts to Re-verify Against Current Versions
 
 These claims are central to the lessons and must be checked against the exact versions captured, with results recorded in the bundle manifests and lesson notes:
 
@@ -1086,8 +1246,12 @@ These claims are central to the lessons and must be checked against the exact ve
   - capabilities required for each hook;
   - that `bpf_ktime_get_ns()` and `time.monotonic_ns()` share a clock in the capture environment.
 - **CPython tracing support:** USDT marker names and arguments in a `--with-dtrace` build; `-X perf` perf-map behavior in forked children.
+- **Stacks:**
+  - that Gunicorn's `spawn_worker` still forks inside the arbiter's call chain, so worker stacks begin with arbiter frames in the captured version;
+  - whether py-spy and Austin follow forked children and pause the target while sampling;
+  - which pprof and OpenTelemetry profile formats carry per-sample timestamps.
 
-## 20. Definition of Done for the MVP
+## 21. Definition of Done for the MVP
 
 The MVP is complete when:
 
@@ -1099,15 +1263,16 @@ The MVP is complete when:
 - the model engine passes its invariants and stays within calibration tolerance of every canonical scenario;
 - the concept inventory, transfer task, and concept map run end to end, and progress can be exported;
 - accessibility checks pass and a manual screen-reader pass is complete;
-- the facts in Section 19 are verified for the captured versions;
-- if traced startups were included, scenario 13 replays step by step with zero unexplained gaps and reconciliation drift below threshold; and
+- the facts in Section 20 are verified for the captured versions;
+- if traced startups were included, scenario 13 replays step by step with zero unexplained gaps and reconciliation drift below threshold;
+- if the recorded 4D flame graph was included, it scrolls through scenario 13 within budget with annotations for every fork, import phase, and finding, and its flat equivalent is complete; and
 - a pilot cohort has completed the course and its results are documented.
 
-## 21. Immediate Next Actions
+## 22. Immediate Next Actions
 
 1. Stand up the reference VM and run the Phase 0 capture and effect-size spikes with a throwaway Django project, including the `bpftrace` startup trace for spike S5.
-2. Build the renderer budget spike with synthetic page data at Z2 scale.
+2. Build the renderer budget spike with synthetic page data at Z2 scale, and a 4D flame graph prototype on stacks from the S5 recording.
 3. Draft Modules 3–4 as a clickable prototype and run the metaphor test with five learners.
 4. Write the world-state and event schema shared by the model engine, replay engine, and renderers.
 5. Draft the concept inventory and the misconception-to-moment mapping before writing lesson narration.
-6. Schedule an expert review of Sections 3, 5, and 19 before Phase 1 content work begins.
+6. Schedule an expert review of Sections 3, 5, and 20 before Phase 1 content work begins.
