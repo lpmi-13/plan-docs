@@ -6,7 +6,7 @@ A team starts and joins one disposable iximiuz Labs playground from the browser,
 
 The aim is to practice **incident response as a team**: noticing impact, building a shared picture, coordinating changes, checking the result, and communicating resolution. The lab should make a fix possible without making the answer visible in the alert.
 
-This is still a discussion draft, not an implementation specification. Items under **Decisions so far** are settled; anything marked **Proposed** is the current direction and remains open. The first release should be a credible, repeatable four-VM incident with a modest visual room. More faults, workflows, and richer visualization can follow once that experience is convincing.
+This is still a discussion draft, not an implementation specification. Items under **Decisions so far** are settled; anything marked **Proposed** is the current direction and remains open. The first release should be a credible, repeatable five-VM incident with a modest visual room. More faults, workflows, and richer visualization can follow once that experience is convincing.
 
 ## Decisions so far
 
@@ -17,6 +17,7 @@ This is still a discussion draft, not an implementation specification. Items und
 - **Platform web terminals with a name pool.** The owner shares one terminal link on `edge-01` for a shared login account. Each session gets a random name from a pool and its own Linux user, and onward SSH to the other VMs keeps the name. There is no custom terminal gateway.
 - **Routine noise in the inbox.** A steady stream of events, most of them safe to ignore, makes the stable period feel like production.
 - **PostgreSQL 18** on `data-01`.
+- **The shop runs on a multi-node k3s cluster, and the lab's own machinery does not.** Customers reach small services in Go, Python, and TypeScript, running as Kubernetes deployments with different replica counts, so the system looks like a live production ecosystem. The secrets manager, fault injection, evaluator, room, and monitoring stay as systemd services on `ops-01`, outside the cluster, where a team working in the cluster cannot damage or read them. PostgreSQL stays on `data-01` and the edge proxy on `edge-01`, also outside the cluster, like a managed database and a cloud load balancer.
 - **The MVP ends after one fix.** When the fix is confirmed, a resolved notification reaches every relevant interface, including the separate spectator web app.
 - **MVP spectator app over SSE, with no streaming.** Connected web clients see what is currently happening through simple 2D shapes for each VM, with colors for CPU, memory, and similar stats. They also see whether the system is degraded and how, from simple SLOs such as error rate and latency on user-facing endpoints, and they see the fixed notification. This will be elaborated later.
 - **Post-MVP: random breakages after each fix.** Each confirmed fix leads to another randomly chosen fault.
@@ -36,14 +37,29 @@ This is still a discussion draft, not an implementation specification. Items und
 
 | VM | Job | Why it matters to the incident |
 | --- | --- | --- |
-| `edge-01` | User entry point and synthetic clients | Gives the team an external view of availability and latency. |
-| `app-01` | API and background worker | Provides deploy, configuration, process, and performance faults. |
-| `data-01` | PostgreSQL 18 database or a queue | Creates dependencies where a healthy process can still serve failed transactions. |
+| `edge-01` | User entry point, load balancer into the cluster, synthetic clients, and the shared terminal login | Gives the team an external view of availability and latency, and keeps entry working if a cluster node fails. |
+| `app-01` | k3s control plane and worker node | Provides deploy, configuration, process, and performance faults, and hosts the Kubernetes API the team repairs through. |
+| `app-02` | k3s worker node | Spreads replicas across a second machine, so a failure can be partial and teammates can look in different places. |
+| `data-01` | PostgreSQL 18 database, used as the first queue | Creates dependencies where a healthy pod can still serve failed transactions. |
 | `ops-01` | Metrics, alerts, incident room, scenario control, secrets manager, and protected evaluation | Keeps the investigation surface available while the application is damaged, and keeps scenario logic off the VMs the team controls. |
 
-This is a **starting layout**, not a fixed product architecture. A fifth VM could hold a second app replica for failover scenarios or separate the evaluator from observability. A rough first sizing question is whether the three workload VMs can run near 1 vCPU/1 GiB each while the operations VM runs near the Grafana lab's 2 vCPU/3 GiB. That totals 5 vCPU/6 GiB, which fits the documented free-tier limit with no spare vCPU, so adding a fifth VM on the free tier would mean scaling down. Those numbers are a candidate experiment, not a measured result. Keep all five or fewer VMs in one playground unless a tested scenario truly needs another failure domain or more capacity. Networking two or three playgrounds remains a fallback whose reachability, session ownership, lifetime, and teardown would need proof first.
+These five VMs are the platform's limit, and they use the whole free-tier budget: 1 vCPU each, with 1 GiB on `edge-01` and `data-01`, 2 GiB on `app-01`, 1.5 GiB on `app-02`, and 2.5 GiB on `ops-01`, for a total of 5 vCPU and 8 GiB. Measured on free-tier VMs with k3s v1.37 and its optional add-ons turned off, an idle control plane node uses about 375 MiB above the base system and an idle agent about 200 MiB. `ops-01` drops from 2 vCPUs to 1, but during a full incident its CPU stayed near 3%, and the busiest VM, `app-01`, used about 800 MiB of its 2 GiB. Networking two or three playgrounds remains a fallback whose reachability, session ownership, lifetime, and teardown would need proof first.
 
-The service need only be complex enough to produce useful causal paths: for example, a storefront or order API where a request crosses edge, app, and data, with a background worker processing orders. The workload should be small and steady enough for clear metrics. Every scenario starts from a verified healthy state. **Proposed:** build a new small order API and worker on systemd with a baked root filesystem, using a PostgreSQL 18 table as the first queue. PostgreSQL provides real authentication, connection limits, and slow queries for the roadmap.
+The service need only be complex enough to produce useful causal paths. Every scenario starts from a verified healthy state.
+
+| Deployment | Language | Replicas | Job | Reached by |
+| --- | --- | --- | --- | --- |
+| `storefront` | TypeScript | 2 | Serves the storefront page. Uses no database. | `GET /` |
+| `catalog` | Python | 2 | Lists products from PostgreSQL. | `GET /products` |
+| `orders` | Go | 3 | Writes orders to PostgreSQL. | `POST /orders` |
+| `fulfilment` | Python | 1 | Background worker that claims and finishes pending orders, using a PostgreSQL table as the queue. | Nothing directly |
+
+The shop's manifests and container images are baked into the root filesystem, so a session needs no registry to start. These rules follow from testing on real VMs:
+
+- **Manifests are applied once at first boot, not through the k3s auto-deploy directory.** Auto-deploy re-applies its files whenever k3s restarts. In a test, this silently put a Secret back to its original value after a team had changed it, so a reboot of `app-01` would have undone a correct repair.
+- **`kubectl` is a separate binary.** The copy built into k3s unpacks a data directory into each user's home on first use, which would happen for every name in the pool.
+- **Prometheus on `ops-01` scrapes pods through the Kubernetes API,** using a read-only token that cannot read Secrets. The cluster needs no monitoring components and no extra routes, and nothing the lab depends on runs inside it.
+- **Traefik, ServiceLB, metrics-server, and the local-path provisioner are off.** `edge-01` proxies to NodePort services on both nodes. This saves memory and start time on small VMs, and a production-style ingress could be added once there is a scenario for it.
 
 Participants can view the operations surfaces, but the scenario selector, answer key, secrets manager credentials, and evaluator stay out of their reach. **Proposed:** set `noSSH: true` on `ops-01`, which the [docs](https://labs.iximiuz.com/docs/custom-playgrounds/multi-machine-playgrounds) describe for verifier machines, so hiding the evaluator does not need a fifth VM. The spike must confirm that this blocks SSH from the other VMs while `ops-01` can still reach them and expose ports. A platform task is not a stronger boundary by itself, because it runs on a named machine.
 
@@ -52,13 +68,18 @@ Participants can view the operations surfaces, but the scenario selector, answer
 ```mermaid
 flowchart LR
     U[Simulated users] --> E[edge-01]
-    E --> A[app-01]
-    A --> D[data-01]
-    E & A & D --> O[ops-01: observe and evaluate]
+    subgraph K[k3s cluster]
+        A[app-01: control plane and worker]
+        B[app-02: worker]
+    end
+    E -->|NodePort| A & B
+    A & B --> D[data-01]
+    E & K & D --> O[ops-01: observe and evaluate]
     P[Team members] --> R[Shared incident room]
     R --> O
     P -->|shared terminal link| E
-    E -. onward SSH .-> A & D
+    E -. onward SSH .-> A & B & D
+    E -. kubectl .-> A
     S[Spectators] -->|SSE| O
     O -. rotates password over Postgres .-> D
 ```
@@ -208,7 +229,7 @@ The password can be rotated over Postgres, but app and edge faults such as a bad
 
 ### First fault: rotated database password
 
-The secrets manager on `ops-01` rotates several harmless credentials as routine work, and each rotation appears in the inbox. At a random point 2 to 4 minutes after **Start shift**, it also rotates the order database password with `ALTER ROLE` over a normal Postgres connection, using a dedicated privileged role. The app still reads the old password from its configuration. State lives on `ops-01`, so the rotation happens once and a `data-01` reboot cannot re-fire it after a repair.
+The secrets manager on `ops-01` rotates several harmless credentials as routine work, and each rotation appears in the inbox. At a random point 2 to 4 minutes after **Start shift**, it also rotates the order database password with `ALTER ROLE` over a normal Postgres connection, using a dedicated privileged role. The `orders`, `catalog`, and `fulfilment` deployments still get the old password from a Kubernetes Secret, which they read as an environment variable when a pod starts. State lives on `ops-01`, so the rotation happens once and a `data-01` reboot cannot re-fire it after a repair.
 
 Options considered for performing the rotation:
 
@@ -227,17 +248,22 @@ Behavior tested on PostgreSQL 16 and 18 in a throwaway local container:
 - **The password need not leak.** Sending a pre-hashed password puts only the hash in the log.
 - **A bypass is detectable without host access.** A non-superuser role can read `pg_hba_file_rules` after a grant.
 
-Because live connections survive, the app's connection handling decides when the incident starts. A new connection per request fails immediately and totally. Having the rotator kill existing sessions also fails immediately, and the kills are a tell. **Proposed:** use a pool with a maximum connection lifetime of 60 to 90 seconds. Failures build up as connections expire, and a reflexive restart should turn a partial outage into a full one. The first customer alert would arrive roughly 3 to 6 minutes after **Start shift**, to be tuned in testing. The confirmation step must wait for connections to expire before deciding that injection failed.
+Because live connections survive, the app's connection handling decides when the incident starts. A new connection per request fails immediately and totally. Having the rotator kill existing sessions also fails immediately, and the kills are a tell. **Proposed:** use a pool with a maximum connection lifetime of 60 to 90 seconds. Failures build up as connections expire, replica by replica, and a reflexive restart should turn a partial outage into a full one. The first customer alert would arrive roughly 3 to 6 minutes after **Start shift**, to be tuned in testing. The confirmation step must wait for connections to expire before deciding that injection failed.
+
+Readiness and liveness probes check only that the process is running, so pods stay `Running` and `Ready` while customers fail. A database check in the readiness probe would stall a bad rollout and hide this. The plan's rule that a green process or ready pod cannot answer whether the system is fixed is the point of the exercise.
 
 **Proposed:** the secrets manager offers the current password through a room page or CLI, and each reveal goes on the timeline.
 
 | Team action | Proposed result |
 | --- | --- |
-| Copy the new password from the secrets manager to `app-01` and restart | Intended fix |
+| Copy the new password from the secrets manager into the Kubernetes Secret and restart all three deployments | Intended fix |
 | Set a new password on both sides | Accepted |
 | Put the old password back on the database | Service recovers, but the room flags that the stored secret no longer matches |
 | Set `trust` in `pg_hba.conf` | Rejected |
-| Restart the app only | Does not help |
+| Restart the deployments only | Does not help, and turns a partial outage into a full one |
+| Update the Secret but restart nothing | Does not help, because running pods keep the old value |
+| Update the Secret and restart only some deployments | Partial recovery. The incident stays open until the customer journeys and the order worker all recover |
+| Scale a failing deployment to zero | Rejected, because the customer journey stays broken |
 
 ## Making the social and visual parts useful
 
@@ -311,7 +337,7 @@ The base image's SSH socket also listens on vsock. If the web terminal uses that
 
 ## Suggested first slice
 
-Build one repeatable incident on the four-VM topology: a customer request crosses edge, app, and data; the injected fault breaks that path; Grafana and the inbox show impact; two participants investigate on different hosts; one repairs it; the evaluator checks a real transaction for sustained recovery; the resolved notification reaches every relevant interface; the room shows the sequence of actions. The fault is the rotated database password, whose correct repair is clearly observable and whose monitoring stays available.
+Build one repeatable incident on the five-VM topology: a customer request crosses edge, cluster, and data; the injected fault breaks that path; Grafana and the inbox show impact; two participants investigate on different hosts; one repairs it; the evaluator checks a real transaction for sustained recovery; the resolved notification reaches every relevant interface; the room shows the sequence of actions. The fault is the rotated database password, whose correct repair is clearly observable and whose monitoring stays available.
 
 Then add catalog variety and collaboration depth in this order:
 
@@ -336,6 +362,7 @@ The spike may use `labctl` for convenience, but the resulting lab must not depen
 7. What session lifetime limits apply, especially on the free tier?
 8. Do long-lived SSE connections work through a public exposed port? `doom-perf` uses `EventSource` through an `http-port` tab, but no local lab yet shows this through a public port.
 9. What do error rate and latency look like on a healthy baseline, so the SLO targets can come from measurements?
+10. Does a multi-node k3s cluster fit on free-tier VMs alongside the operations stack, and can `ops-01` observe it from outside? Measured: yes, with 1 vCPU per VM. The measurements and test method are in `breakteam/docs/spike-results.md`.
 
 ## Post-MVP scenario roadmap
 
@@ -392,8 +419,7 @@ This scope has some consequences:
 - **Hints and pacing:** what should the timed hints say, and when should they appear? What are the target run length and team size? The draft assumes 2 to 4 people.
 - **Scenario SLOs:** the MVP uses simple SLOs on user-facing endpoints. Should later scenarios add their own targets or error budgets?
 - **Config-driven scenarios:** should one general system hydrate a scenario from JSON, YAML, or similar configuration that declares its components, injected breakage, and remediation checks? Determine which parts can be shared across fault families without obscuring the causal story.
-- **Resource envelope:** which VM shapes can run the full stack with headroom inside the free-tier limit of 5 vCPU/8 GiB? The documented limits are known, but the lab's actual usage is not.
-- **k3s substrate:** would running the service on k3s make the scenarios simpler and pedagogically stronger, or would Kubernetes add concepts that distract from the incident being taught? Compare it with the VM-based first slice on setup cost, fault variety, and clarity of repair. **Proposed:** systemd on VMs for the first slice, with Docker Compose as a middle option if bad releases need image rollback. k3s is hard to fit on 1 GiB VMs, and Manifest Dojo already teaches it.
+- **Resource envelope:** the five VMs use the entire free-tier budget of 5 vCPU/8 GiB, which leaves no room for a third cluster node. Measured use is well below that budget, so memory could move between VMs if a later scenario needs it.
 - **Second playground:** only reconsider if a measured limitation or a particular fault requires it, after checking cross-playground networking and shared lifecycle.
 - **Fault delivery beyond the database:** random breakages make this a post-MVP prerequisite. App and edge faults need a non-SSH path, such as a configuration channel that is part of the system, or platform tasks once their behavior is tested.
 - **Time-based leaderboard:** if added later, measure from first customer failure to sustained recovery, because the start delay is random. Random fault sequences also make run totals hard to compare. The timeline should record both times from the start. A leaderboard would need a service outside the playground, and teams have root on the workload VMs, so results would rely on trust unless `ops-01` signs them.
