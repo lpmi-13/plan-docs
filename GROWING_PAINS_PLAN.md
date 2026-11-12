@@ -58,6 +58,18 @@ These facts were checked with `labctl` on 2026-11-10:
 - **One playground gets 10 vCPU and 16 GiB across up to five VMs.** An earlier four-VM premium play ran 4 + 2 + 2 + 2 vCPU with 4 GB each, and single-VM premium plays ran 4 vCPU with 8 and 10 GiB. This matches the documented paid limits of 4 vCPU and 10 GiB per VM and 10 vCPU and 16 GiB per playground. `labctl playground catalog` still describes `flexbox` as having **up to five VMs**, and its default image is `ubuntu-26-04`.
 - **Requests over the limits are scaled down proportionally,** so the free tier would quietly halve every capacity unit. **Proposed:** a preflight reads `nproc` and `MemTotal` on every VM. If they are under the plan, it refuses to start, or runs a half-scale profile where all rates and caps are halved. CPU caps make this scale almost linearly.
 
+### Exploratory SQL throughput, not shop capacity
+
+A separate `labctl` exploration in November 2026 ran PostgreSQL 18.6 for about 15 seconds per case, with warmed data, prepared statements, and local Unix sockets. Each database VM was independent. The figures are observed aggregate rates for those runs, not a sustained ceiling for one coherent database or for the HTTP shop.
+
+| Allocation tested | Trivial `SELECT 1`/s | Indexed prepared reads/s | `pgbench -N` write transactions/s |
+| --- | ---: | ---: | ---: |
+| Free: 5 vCPU, 8 GiB, three independent database VMs | ~610,000 | ~376,000 | ~50,000 |
+| Premium: one 10-vCPU playground, three to five independent database VMs | ~650,000 | ~490,000 | ~68,000 |
+| Premium: five concurrent playgrounds, ~50 vCPU and 15 independent database VMs | ~2,710,000 | ~1,750,000 | ~258,000 |
+
+The free allocation did not reach one million SQL operations/s in these tests. The one-million mark was exceeded only by aggregating independent databases across several premium playgrounds; that result is not the capacity of one playground or one database. None of these tests included HTTP, the shop's joins and aggregates, stock-row contention, the 1.5-core `db.medium` cap, replication, or the plan's correctness and latency checks. Establish the actual ceiling as the highest *sustained offered request rate* that still meets those checks, with generator saturation and dropped arrivals reported separately. Never use `SELECT 1` as the capacity estimate for the shop.
+
 CPU, not memory, is the binding constraint. Ten vCPU must cover the load generator, observability, the control plane, and every component the shop can grow. The design therefore keeps every capacity unit small and explicitly capped (see **Instance sizes** below).
 
 ## One playground first
@@ -157,6 +169,8 @@ A small marketplace: sellers list products with variants, and shoppers browse, s
 
 A Go implementation of the hot paths waits in the image for the language move: the read endpoints (home, listings, details, and search) and the image worker. It is built against the same API contract and passes the same conformance suite as the Python code in CI, so the move is a rollout, not a rewrite. Writes stay in Python. They are a small share of requests, and two implementations of every write path would double the work for little gain.
 
+Rust, Java, and C++ are also possible implementations of the shop's hot paths if the measured Go version reaches a per-core limit. Rust and C++ invite a comparison of per-request CPU and memory at the cost of more implementation and maintenance work; Java invites a comparison of mature HTTP/database tooling against JVM warm-up and footprint in a short, memory-limited lab. None has a measured advantage for this shop. Any language trial must return identical responses, retain the write and read-your-writes contract, and report throughput **at the same CPU quota and SLO**, rather than raw requests/s from a different service.
+
 The lab's own machinery (crowd, prober, architect, twin, and narrator) is Go. Each part needs only tens of MB of memory, and the architect and the twin can share code.
 
 | Endpoint | Kind | Notes |
@@ -194,6 +208,35 @@ The genesis shop makes the choices a small startup really makes. Each one works 
 
 One concession is deliberate: tenant-scoped tables use `seller_id` in their primary key from the start, so sharding stays possible later without rekeying the whole schema. The decision record for the sharding move says that the founders chose a tenant key early.
 
+### PostgreSQL capacity choices to test
+
+The MVP peak is a proposed 700 HTTP req/s with 10–15% writes, or roughly 70–105 write requests/s. HTTP requests can execute multiple SQL statements, and the expensive listing and detail queries are intentionally unlike point lookups. The database's proposed 1.5-core quota may become the first hard limit. The earlier lab SQL rates above do not predict this workload's throughput.
+
+| Candidate | Expected benefit and condition | Cost or guard |
+| --- | --- | --- |
+| Reuse connections; prepare repeated parameterized SQL | Less connection setup and repeated parse work. In one synthetic single-VM run, prepared `pgbench -S` rose from ~115,000 to ~175,000 reads/s at eight clients. | This was a protocol/statement benchmark, not an HTTP-shop result. With PgBouncer transaction pooling, configure and test [`max_prepared_statements`](https://www.pgbouncer.org/faq.html). |
+| Fix N+1 detail reads, batch importer inserts, add selective indexes, and examine listing plans | Reduce statements, scans, and round trips while preserving the shop's response contract. | Each extra index also costs memory and write work; prove a gain on the actual query mix. |
+| Keep frequently changed stock and price data lean; consider table `fillfactor` | [HOT updates](https://www.postgresql.org/docs/18/storage-hot.html) avoid new index entries when indexed columns stay unchanged and a page has free space. | An update to an indexed price cannot use HOT. This does not remove the flash-sale stock-row lock. Track `n_tup_hot_upd` against all updates. |
+| Tune autovacuum and analyze per hot table | Avoid dead-row buildup and stale plans during repricing and deletes. The default vacuum scale factor is [20% of table size](https://www.postgresql.org/docs/18/runtime-config-vacuum.html), which may be late for a large churning table. | Keep autovacuum on; tighter thresholds spend CPU and I/O. Measure bloat, dead tuples, and vacuum time. |
+| Size memory for the cgroup, then tune costly queries | The proposed 512 MiB `shared_buffers` is already about one-third of 1.5 GiB. Set `effective_cache_size` to a plausible cache *estimate*; increase `work_mem` only for measured spills or chosen query classes. | [`work_mem` can be consumed by each sort or hash in each concurrent query](https://www.postgresql.org/docs/18/runtime-config-resource.html). More shared buffers leave less room for the OS cache and backends. |
+| Allow more WAL between checkpoints if checkpoints are too frequent | Larger `max_wal_size`, and possibly `checkpoint_timeout`, can smooth write bursts while preserving durability. | More WAL disk use and potentially longer crash recovery. Keep the default 0.9 checkpoint completion target unless evidence says otherwise. [WAL settings](https://www.postgresql.org/docs/18/runtime-config-wal.html). |
+| Precompute expensive listing aggregates or build a read model | Spend background write work and some freshness to save repeated aggregate reads. | The plan permits listing staleness p99 ≤15 s and detail staleness p99 ≤2 s; token-carrying read-your-writes paths still bypass stale copies. |
+
+Use `pg_stat_statements`, `EXPLAIN (ANALYZE, BUFFERS, WAL)` on representative queries, `pg_stat_io`, table HOT/vacuum counters, and checkpoint and replication metrics to pick candidates. A global JIT or parallel-query change is lower priority for short OLTP statements; test it only when plans show those features running. The high-value experiments keep order, stock, idempotency, and outbox semantics intact.
+
+The tempting durability shortcuts change the promise. [`synchronous_commit=off`](https://www.postgresql.org/docs/18/runtime-config-wal.html) can lose recently acknowledged commits after a crash. `fsync=off` or `full_page_writes=off` can cause unrecoverable corruption. [Unlogged tables](https://www.postgresql.org/docs/18/sql-createtable.html) are truncated after an unclean shutdown and are absent from standbys; use them only for rebuildable scratch data. `wal_level=minimal` prevents the streaming read replica and WAL-based migration paths. A separately labelled disposable-throughput run may measure these settings, but the normal shop run retains its zero-acknowledged-write-loss goal. PostgreSQL's [non-durable settings guide](https://www.postgresql.org/docs/18/non-durability.html) lays out the trade.
+
+### Other SQL database roles to revisit
+
+The requirement is relational, transactional shop data, not a particular brand of SQL. Compare alternatives against multi-row order transactions, foreign keys, point reads, frequent product edits and deletes, replication/failover, read-your-writes, memory footprint, and the 10-vCPU playground budget. No alternative has a measured win for this shop yet.
+
+| Option | Where it might help | Why it is not the current primary choice |
+| --- | --- | --- |
+| [PostgreSQL 18](https://www.postgresql.org/docs/18/) plus read replicas, read models, and Citus | Keeps the existing schema, drivers, WAL-token design, and planned online growth path. | A single primary still has a write ceiling and a hot row still serializes. Tune and measure before replacing it. |
+| [MySQL/InnoDB](https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-model.html) or MariaDB | A credible row-store OLTP comparison on one VM. | Changes SQL, driver, replication and cutover work without evidence of higher shop throughput. Benchmark the same transactions and SLOs if PostgreSQL reaches its limit. |
+| Distributed SQL: [CockroachDB](https://www.cockroachlabs.com/docs/stable/developer-basics.html), [YugabyteDB YSQL](https://docs.yugabyte.com/stable/faq/compatibility/), or [TiDB](https://docs.pingcap.com/tidb/stable/tidb-faq/) | Relational transactions with horizontal data distribution; relevant if writes spread across many sellers and one primary is exhausted. | Coordination, retries, compatibility differences, and multi-node CPU/memory cost must be measured; none removes contention on one stock row. TiDB also changes the shop to a MySQL-compatible dialect. |
+| [ClickHouse](https://clickhouse.com/resources/engineering/oltp-vs-olap) | A SQL analytical read store for large aggregates, event history, or dashboards fed from the outbox. Recent [lightweight updates](https://clickhouse.com/blog/updates-in-clickhouse-2-sql-style-updates) broaden its uses. | It is optimized for analytical access. The shop's multi-table order/stock transaction and frequent small writes need a separate, explicit conformance test before considering it as the source of truth. Its best first role is a derived read store, if those queries justify its footprint. |
+
 ### Mechanisms the shop supports from genesis
 
 These are built in from the start, so moves only change configuration.
@@ -207,6 +250,8 @@ These are built in from the start, so moves only change configuration.
 
 **Proposed:** a small Go program rather than k6, because the run needs things k6 makes awkward: exact replay from a seed, logical IDs for state-changing operations, a ledger to check durability against, and a low CPU cost on a shared VM. k6 2.3 remains useful for calibrating single-unit capacity during the spike.
 
+Go remains the default for the integrated crowd, but generator overhead should be measured before assuming it is the limit. Rust with an async HTTP runtime such as [Tokio](https://tokio.rs/tokio/tutorial) could reduce per-client overhead at the cost of more implementation work; Java's [asynchronous HTTP client](https://docs.oracle.com/en/java/javase/25/docs/api/java.net.http/java/net/http/HttpClient.html) or virtual threads offer mature tooling but require JVM warm-up and memory measurement; C++ with [libcurl's multi interface](https://curl.se/libcurl/c/libcurl-multi.html) offers tight control at the cost of a more complex event loop and resource lifetime management. A generator comparison must reuse the **same** arrival schedule, journeys, request bytes, timeouts, ledger, and error accounting. Measure scheduled versus actual send times, client CPU and memory, maximum sustainable offered rate, and whether the shop's p95 changes when the generator moves to another node. Keep k6 for simple calibration, not as a substitute for the stateful crowd.
+
 | Persona | Behavior | Pressure it can create |
 | --- | --- | --- |
 | Shopper | Home, listing, detail, search, sometimes review or order. Holds a session cookie. Some type searches one keystroke at a time and make typos at a seeded rate. | Reads, hot keys, search behavior, orders |
@@ -218,7 +263,8 @@ These are built in from the start, so moves only change configuration.
 | Flash-sale mob | Bursts on a few products and their checkout | Hot keys and the hot stock row |
 | Crawler | Walks listing pages, requests deleted IDs, ignores caching hints | Abusive client and negative lookups |
 
-- **Open-loop arrivals.** Sessions arrive as a Poisson process at the storyline's rate, whether or not the shop is keeping up. A closed-loop generator would slow down with the shop and hide the overload. Each session runs a short journey with seeded think times.
+- **Open-loop session starts.** Sessions start on a seeded Poisson schedule independent of responses. At a constant rate λ sessions/s, counts in an interval of length t have mean λt and standard deviation √(λt), and the mean gap is 1/λ. The ramps use a time-varying λ(t), with scheduled times computed ahead of responses. Each session still runs a short journey with seeded think times, so its later HTTP requests depend on earlier responses: Poisson session starts do **not** make HTTP requests a Poisson process or guarantee a fixed HTTP req/s when the shop slows. Calibrate the session start rate against healthy requests per session to reach the storyline's HTTP rate targets. Schedule independent anonymous and crawler requests directly when a fixed offered HTTP rate is needed; keep stateful journeys and count their foregone steps separately.
+- **Offered-load accounting.** Record scheduled session starts, actual send time and schedule lag, attempted HTTP requests, completed responses, timeouts, and sessions refused or later journey steps suppressed by the in-flight cap. Chart these alongside achieved HTTP req/s; a falling completion rate or disappearing journey steps must not look like success. The prober stays independent. For intuition, if *HTTP requests themselves* were Poisson at 700/s, one-second counts would average 700 with standard deviation about 26, and 100 ms counts would average 70 with standard deviation about 8. Flash-sale key skew and correlated bursts are additional workload dimensions, not consequences of a Poisson rate. At 700 req/s and 100 ms mean time in flight, Little's law gives about 70 concurrent requests on average: throughput and simultaneous concurrency are separate limits.
 - **Determinism.** Each session draws from its own PRNG stream, derived from the seed and the session's index, so concurrency does not reorder random choices.
 - **The ledger.** The crowd records every product it creates, edits, and deletes under a logical ID, along with the latest description version it saw acknowledged. Reads and edits of its own products go through the ledger. A 404 for something the ledger says exists, or an old description after a confirmed edit in the same session, counts as a **correctness error**, never as a cache miss.
 - **Client behavior.** Reads have a 2 s timeout and no retries. Writes retry once with the same idempotency key. Both the first attempt and the final outcome are recorded.
@@ -868,6 +914,11 @@ At the MVP's peak of about 700 req/s with roughly 4 ms of Python CPU per read, t
 15. Do the Python and Go read paths return identical responses on mirrored traffic, and how much CPU and memory per request does the Go path save?
 16. Does each storyline's distinguishing traffic feature (repeat ratio, prefix share, churn, rows per transaction, and so on) land clearly on one side of its boundary in real runs, as the twin predicts?
 17. Does a README `<picture>` on GitHub honour a `max-width` media query alongside `prefers-color-scheme`, in desktop browsers, phone browsers, and the GitHub mobile app? Do outlined SVGs, and CSS animation if the stretch is pursued, render there as they do in the local preview?
+18. At each offered rate, how many sessions were scheduled, started, refused at the cap, and completed? How many HTTP attempts, timeouts, and later journey steps were suppressed? Does a fixed Poisson session schedule still expose overload when the shop's responses slow? Calibrate session starts to the proposed HTTP req/s chapters without using achieved throughput as the demand signal.
+19. On the real catalog and request mix, what do prepared statements and pooling, query/index changes, HOT-friendly schema choices, per-table autovacuum, a listing read model, and checkpoint sizing buy under the 1.5-core database cap? Compare sustained offered HTTP rate, p95/p99, SQL calls and WAL per request, data correctness, and replica lag. Keep durable settings for the normal run.
+20. Does the integrated Go crowd saturate before the shop or distort `ops-01`? If so, compare Rust, Java, and C++ generators using identical seeded schedules and request bodies, including warm-up, memory, and schedule lag. Move the generator or select another implementation only on measured benefit.
+21. If the shop outgrows a tuned PostgreSQL primary, do MySQL/InnoDB, distributed SQL, or a PostgreSQL-plus-ClickHouse read store improve the *same* shop workload per playground CPU and GiB? Include order/stock correctness and cutover cost, not only trivial SELECT or ingest rates. The 15-second multi-VM SQL figures above are leads for experiments, not the answer.
+22. On free, one premium playground, and any separately labelled multi-playground configuration, what sustained database-directed HTTP rate survives a full ramp and plateau while meeting the same latency and correctness SLOs? Report offered and achieved rates, all CPU and memory used, duration, and whether the databases share one logical shop. This is the experiment that could turn exploratory SQL rates into a defensible tier ceiling.
 
 ## Ideas beyond the catalog
 
